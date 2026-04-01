@@ -1,7 +1,9 @@
 # Build outputs
 game.js
 game_gbc.js
+game_snes.js
 game_ps1.js
+game_dc.js
 game.wasm
 game.data
 

@@ -39,7 +39,7 @@
 </div>
 <div id="ui">
   <label>Load ROM
-    <input type="file" id="rom-input" accept=".gb,.gbc,.nes,.sfc,.smc,.gba" hidden>
+    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs" hidden>
   </label>
   &nbsp; <span id="status">No ROM loaded</span>
 </div>
@@ -60,6 +60,58 @@ const overlay = document.getElementById('overlay');
   canvas.height = h;
 })();
 
+// ── Core routing ──────────────────────────────────────────────
+const CORE_MAP = {
+  'gb':  'game_gbc.js',
+  'gbc': 'game_gbc.js',
+  'sfc': 'game_snes.js',
+  'smc': 'game_snes.js',
+  'fig': 'game_snes.js',
+  'swc': 'game_snes.js',
+  'bs':  'game_snes.js',
+};
+
+let coreModule = null;
+let loadedCore = null;
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// Capture any JS errors and show them in the status bar
+window.onerror = function(msg, src, line) {
+  setStatus('JS error: ' + msg + ' (' + (src||'').split('/').pop() + ':' + line + ')');
+};
+
+function loadCore(bundle, callback) {
+  if (loadedCore === bundle) { callback(); return; }
+  if (loadedCore !== null) {
+    if (!confirm('Loading a different core requires a page reload. Continue?')) return;
+    location.reload();
+    return;
+  }
+  setStatus('Loading core...');
+
+  // Let Emscripten create its own Module — no pre-configuration needed.
+  // Poll until Module.calledRun is true, which means doRun() has finished
+  // (runtime init + main() + retro_init() all complete).
+  const s = document.createElement('script');
+  s.src = bundle;
+  s.onerror = function() { setStatus('Failed to load ' + bundle); };
+  document.body.appendChild(s);
+
+  function waitForReady() {
+    if (window.Module && window.Module.calledRun) {
+      coreModule = window.Module;
+      loadedCore = bundle;
+      callback();
+    } else {
+      setTimeout(waitForReady, 100);
+    }
+  }
+  setTimeout(waitForReady, 200);
+}
+
 // ── Pointer lock ─────────────────────────────────────────────
 canvas.addEventListener('click', () => canvas.requestPointerLock());
 
@@ -72,8 +124,8 @@ document.addEventListener('pointerlockchange', () => {
 });
 
 document.addEventListener('mousemove', e => {
-  if (document.pointerLockElement === canvas) {
-    Module.ccall('add_mouse_delta', 'void', ['number','number'],
+  if (document.pointerLockElement === canvas && coreModule) {
+    coreModule.ccall('add_mouse_delta', 'void', ['number','number'],
                  [e.movementX, e.movementY]);
   }
 });
@@ -98,38 +150,48 @@ const GAME_MAP = {
 };
 
 document.addEventListener('keydown', e => {
+  if (!coreModule) return;
   if (MOVE_MAP[e.code] !== undefined) {
     e.preventDefault();
-    Module.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],1]);
+    coreModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],1]);
   }
   if (GAME_MAP[e.code] !== undefined) {
     e.preventDefault();
-    Module.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],1]);
+    coreModule.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],1]);
   }
 });
 
 document.addEventListener('keyup', e => {
+  if (!coreModule) return;
   if (MOVE_MAP[e.code] !== undefined)
-    Module.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],0]);
+    coreModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],0]);
   if (GAME_MAP[e.code] !== undefined)
-    Module.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],0]);
+    coreModule.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],0]);
 });
 
 // ── ROM loading ───────────────────────────────────────────────
 document.getElementById('rom-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
   if (!file) return;
-  document.getElementById('status').textContent = 'Loading ' + file.name + '...';
-  const reader = new FileReader();
-  reader.onload = ev => {
-    FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
-    Module.ccall('start_game', 'void', ['string'], ['/rom.bin']);
-    document.getElementById('status').textContent = 'Playing: ' + file.name;
-  };
-  reader.readAsArrayBuffer(file);
+  const ext = file.name.split('.').pop().toLowerCase();
+  const bundle = CORE_MAP[ext];
+  if (!bundle) {
+    document.getElementById('status').textContent = 'Unsupported format: .' + ext;
+    return;
+  }
+  loadCore(bundle, function() {
+    document.getElementById('status').textContent = 'Loading ' + file.name + '...';
+    const reader = new FileReader();
+    reader.onload = ev => {
+      coreModule.FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
+      coreModule.ccall('start_game', 'void', ['string'], ['/rom.bin']);
+      document.getElementById('status').textContent = 'Playing: ' + file.name;
+    };
+    reader.readAsArrayBuffer(file);
+  });
 });
 </script>
 
-<script src="game.js"></script>
+<!-- Core is loaded dynamically based on ROM file extension -->
 </body>
 </html>
