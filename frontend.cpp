@@ -105,9 +105,19 @@ static float g_room_rot_y = -3.14159265f;   // radians (-180 deg)
 static float g_room_tx = 4.f, g_room_ty = 21.f, g_room_tz = 15.f;
 static GLuint g_prog     = 0;
 static int    g_a_pos=-1, g_a_uv=-1, g_a_norm=-1;
-static int    g_u_mvp=-1, g_u_model=-1, g_u_tex=-1, g_u_screen=-1, g_u_overscan=-1, g_u_tv_pos=-1, g_u_lamp_pos=-1, g_u_lamp_intensity=-1;
+static int    g_u_mvp=-1, g_u_model=-1, g_u_tex=-1, g_u_screen=-1, g_u_overscan=-1, g_u_tv_quad_pos=-1, g_u_tv_quad_col=-1, g_u_tv_normal=-1, g_u_lamp_pos=-1, g_u_lamp_intensity=-1;
+static float  g_tv_screen_normal[3] = {0.f, 0.f, -1.f};  // base outward normal
+static float  g_cone_yaw   =    0.f;   // degrees, rotates cone left/right
+static float  g_cone_pitch = -362.f;   // degrees, tilts cone up/down
+static float  g_cone_power =  18.2f;   // exponent — higher = tighter cone
+static int    g_u_cone_power = -1;
+static int    g_skin_u_cone_power = -1;
 static float  g_overscan_x = 0.04f, g_overscan_y = 0.04f;
 static float  g_tv_screen_pos[3] = {0.f, 0.f, 0.f};
+static float  g_tv_quad_pos[4][3] = {};
+static float  g_tv_quad_col[4][3] = {{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f},{0.3f,0.4f,0.8f}};
+static float  g_tv_light_intensity = 1.7f;
+static float  g_tv_half_x = 0.5f, g_tv_half_y = 0.5f;
 static float  g_lamp_pos[3] = {0.f, -45.f, -260.f};
 static float  g_lamp_intensity = 1.0f;
 static float  g_cat_eye_height  = -35.f; // camera is at eye level; cat rendered this far below
@@ -162,7 +172,7 @@ static int    g_cat_anim_idx = 1; // idle
 static float  g_cat_anim_time = 0.f;
 static int    g_cat_node_count = 0;
 static int    g_skin_u_vp=-1, g_skin_u_world=-1, g_skin_u_bones=-1;
-static int    g_skin_u_tex=-1, g_skin_u_tv_pos=-1;
+static int    g_skin_u_tex=-1, g_skin_u_tv_quad_pos=-1, g_skin_u_tv_quad_col=-1, g_skin_u_tv_normal=-1;
 static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1;
 static int    g_skin_a_pos=-1, g_skin_a_uv=-1, g_skin_a_norm=-1;
 static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
@@ -200,6 +210,7 @@ static int    g_frame_count = 0;
 // ============================================================
 static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static bool     g_running  = false;
+static bool     g_js_colors = false; // true = JS is driving quad colors, skip C++ sampling
 static bool     g_buttons[16] = {};
 static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_refresh
 
@@ -309,15 +320,17 @@ varying vec2 v_uv;
 varying vec3 v_wpos;
 varying vec3 v_wnorm;
 uniform sampler2D u_tex;
-uniform float u_screen;   // 1.0 = screen (emissive), 0.0 = normal
-uniform vec2 u_overscan;  // per-axis overscan factor (0 = none, 0.05 = 5%)
-uniform vec3 u_tv_pos;    // world-space centre of TV screen
-uniform vec3  u_lamp_pos;       // world-space position of interior lamp
-uniform float u_lamp_intensity; // brightness multiplier
+uniform float u_screen;       // 1.0 = screen (emissive), 0.0 = normal
+uniform vec2  u_overscan;     // per-axis overscan factor
+uniform vec3  u_tv_quad_pos[4]; // world-space centre of each screen quadrant
+uniform vec3  u_tv_quad_col[4]; // averaged colour of each screen quadrant
+uniform vec3  u_tv_normal;      // cone direction (unit)
+uniform float u_cone_power;     // cone falloff exponent
+uniform vec3  u_lamp_pos;
+uniform float u_lamp_intensity;
 
 void main() {
     if (u_screen > 0.5) {
-        // Flip X, then zoom in by overscan so image bleeds behind the bezel
         vec2 uv = vec2(1.0 - v_uv.x, v_uv.y);
         uv = uv * (1.0 - 2.0 * u_overscan) + u_overscan;
         gl_FragColor = texture2D(u_tex, uv);
@@ -325,25 +338,29 @@ void main() {
         vec3 n = normalize(v_wnorm);
         vec3 albedo = texture2D(u_tex, v_uv).rgb;
 
-        // ── Interior ceiling lamp (point light, position set via u_lamp_pos) ─
+        // ── Interior ceiling lamp ───────────────────────────────────────────
         vec3 to_lamp  = u_lamp_pos - v_wpos;
         float lamp_dist  = length(to_lamp);
         float lamp_ndotl = max(dot(n, to_lamp / lamp_dist), 0.0);
         float lamp_atten = 1.0 / (1.0 + lamp_dist * lamp_dist * 0.000022);
         vec3 lamp = vec3(1.0, 0.84, 0.55) * lamp_ndotl * lamp_atten * u_lamp_intensity;
 
-        // ── TV screen glow (point light, cool blue-white) ──────────────────
-        vec3 to_tv   = u_tv_pos - v_wpos;
-        float tv_dist   = length(to_tv);
-        float tv_ndotl  = max(dot(n, to_tv / tv_dist), 0.0);
-        float tv_atten  = 1.0 / (1.0 + tv_dist * tv_dist * 0.00028);
-        vec3 tv_glow    = vec3(0.50, 0.62, 1.0) * tv_ndotl * tv_atten * 2.2;
+        // ── TV screen glow: 4 directional quadrant colour-sampled lights ───
+        vec3 tv_glow = vec3(0.0);
+        for (int i = 0; i < 4; i++) {
+            vec3 to_q   = u_tv_quad_pos[i] - v_wpos;
+            float qd    = length(to_q);
+            float ndotl = max(dot(n, to_q / qd), 0.0);
+            float atten = 1.0 / (1.0 + qd * qd * 0.00028);
+            float cone  = max(dot(u_tv_normal, -(to_q / qd)), 0.0);
+            cone        = pow(cone, u_cone_power);
+            tv_glow    += u_tv_quad_col[i] * ndotl * atten * cone * 2.2;
+        }
 
         // ── Very low warm ambient ───────────────────────────────────────────
         vec3 ambient = vec3(0.07, 0.052, 0.034);
 
-        vec3 lighting = ambient + lamp + tv_glow;
-        gl_FragColor = vec4(albedo * lighting, 1.0);
+        gl_FragColor = vec4(albedo * (ambient + lamp + tv_glow), 1.0);
     }
 }
 )";
@@ -382,7 +399,10 @@ in vec2  v_uv;
 in vec3  v_wpos;
 in vec3  v_wnorm;
 uniform sampler2D u_tex;
-uniform vec3  u_tv_pos;
+uniform vec3  u_tv_quad_pos[4];
+uniform vec3  u_tv_quad_col[4];
+uniform vec3  u_tv_normal;
+uniform float u_cone_power;
 uniform vec3  u_lamp_pos;
 uniform float u_lamp_intensity;
 out vec4 fragColor;
@@ -394,11 +414,16 @@ void main() {
     float lamp_ndotl = max(dot(n, to_lamp/ld), 0.0);
     float lamp_atten = 1.0/(1.0+ld*ld*0.000022);
     vec3 lamp = vec3(1.0,0.84,0.55)*lamp_ndotl*lamp_atten*u_lamp_intensity;
-    vec3 to_tv = u_tv_pos - v_wpos;
-    float td = length(to_tv);
-    float tv_ndotl = max(dot(n, to_tv/td), 0.0);
-    float tv_atten = 1.0/(1.0+td*td*0.00028);
-    vec3 tv_glow = vec3(0.50,0.62,1.0)*tv_ndotl*tv_atten*2.2;
+    vec3 tv_glow = vec3(0.0);
+    for (int i = 0; i < 4; i++) {
+        vec3 to_q   = u_tv_quad_pos[i] - v_wpos;
+        float qd    = length(to_q);
+        float ndotl = max(dot(n, to_q/qd), 0.0);
+        float atten = 1.0/(1.0+qd*qd*0.00028);
+        float cone  = max(dot(u_tv_normal, -(to_q/qd)), 0.0);
+        cone        = pow(cone, u_cone_power);
+        tv_glow    += u_tv_quad_col[i]*ndotl*atten*cone*2.2;
+    }
     vec3 ambient = vec3(0.07,0.052,0.034);
     fragColor = vec4(albedo*(ambient+lamp+tv_glow), 1.0);
 }
@@ -721,6 +746,18 @@ static void load_tv() {
                 }
             }
 
+            if (is_screen && pos_acc) {
+                float mn_x=1e9f,mx_x=-1e9f,mn_y=1e9f,mx_y=-1e9f;
+                for (size_t vi=0; vi<pos_acc->count; vi++) {
+                    float p[3]; cgltf_accessor_read_float(pos_acc,vi,p,3);
+                    if(p[0]<mn_x)mn_x=p[0]; if(p[0]>mx_x)mx_x=p[0];
+                    if(p[1]<mn_y)mn_y=p[1]; if(p[1]>mx_y)mx_y=p[1];
+                }
+                g_tv_half_x = (mx_x-mn_x)*0.5f;
+                g_tv_half_y = (mx_y-mn_y)*0.5f;
+                printf("Screen local half-extents: %.3f x %.3f\n", g_tv_half_x, g_tv_half_y);
+            }
+
             TvPrim tp;
             tp.vbo          = vbo;
             tp.vcount       = (int)pos_acc->count;
@@ -957,8 +994,11 @@ static void load_cat() {
     g_skin_u_vp    =glGetUniformLocation(g_skin_prog,"u_vp");
     g_skin_u_world =glGetUniformLocation(g_skin_prog,"u_world");
     g_skin_u_bones =glGetUniformLocation(g_skin_prog,"u_bones");
-    g_skin_u_tex   =glGetUniformLocation(g_skin_prog,"u_tex");
-    g_skin_u_tv_pos=glGetUniformLocation(g_skin_prog,"u_tv_pos");
+    g_skin_u_tex        =glGetUniformLocation(g_skin_prog,"u_tex");
+    g_skin_u_tv_quad_pos=glGetUniformLocation(g_skin_prog,"u_tv_quad_pos");
+    g_skin_u_tv_quad_col=glGetUniformLocation(g_skin_prog,"u_tv_quad_col");
+    g_skin_u_tv_normal  =glGetUniformLocation(g_skin_prog,"u_tv_normal");
+    g_skin_u_cone_power =glGetUniformLocation(g_skin_prog,"u_cone_power");
     g_skin_u_lamp_pos=glGetUniformLocation(g_skin_prog,"u_lamp_pos");
     g_skin_u_lamp_intensity=glGetUniformLocation(g_skin_prog,"u_lamp_intensity");
     g_skin_a_pos    =glGetAttribLocation(g_skin_prog,"a_pos");
@@ -1068,9 +1108,12 @@ static void gl_init() {
     g_u_mvp   =glGetUniformLocation(g_prog,"u_mvp");
     g_u_model =glGetUniformLocation(g_prog,"u_model");
     g_u_tex   =glGetUniformLocation(g_prog,"u_tex");
-    g_u_screen  =glGetUniformLocation(g_prog,"u_screen");
-    g_u_overscan=glGetUniformLocation(g_prog,"u_overscan");
-    g_u_tv_pos  =glGetUniformLocation(g_prog,"u_tv_pos");
+    g_u_screen      =glGetUniformLocation(g_prog,"u_screen");
+    g_u_overscan    =glGetUniformLocation(g_prog,"u_overscan");
+    g_u_tv_quad_pos =glGetUniformLocation(g_prog,"u_tv_quad_pos");
+    g_u_tv_quad_col =glGetUniformLocation(g_prog,"u_tv_quad_col");
+    g_u_tv_normal   =glGetUniformLocation(g_prog,"u_tv_normal");
+    g_u_cone_power  =glGetUniformLocation(g_prog,"u_cone_power");
     g_u_lamp_pos      =glGetUniformLocation(g_prog,"u_lamp_pos");
     g_u_lamp_intensity=glGetUniformLocation(g_prog,"u_lamp_intensity");
 
@@ -1095,6 +1138,32 @@ static void gl_init() {
             g_tv_screen_pos[1] = p.world[13];
             g_tv_screen_pos[2] = p.world[14];
             printf("TV screen world pos: %.2f %.2f %.2f\n", p.world[12], p.world[13], p.world[14]);
+            // World-space half-extent vectors (col 0 = local X, col 1 = local Y)
+            float rx=p.world[0]*g_tv_half_x, ry=p.world[1]*g_tv_half_x, rz=p.world[2]*g_tv_half_x;
+            float ux=p.world[4]*g_tv_half_y, uy=p.world[5]*g_tv_half_y, uz=p.world[6]*g_tv_half_y;
+            // quadrant centres: q0=(-r,-u), q1=(+r,-u), q2=(-r,+u), q3=(+r,+u)
+            const float sgn[4][2] = {{-1,-1},{1,-1},{-1,1},{1,1}};
+            for (int q=0;q<4;q++) {
+                g_tv_quad_pos[q][0] = g_tv_screen_pos[0] + sgn[q][0]*rx*0.5f + sgn[q][1]*ux*0.5f;
+                g_tv_quad_pos[q][1] = g_tv_screen_pos[1] + sgn[q][0]*ry*0.5f + sgn[q][1]*uy*0.5f;
+                g_tv_quad_pos[q][2] = g_tv_screen_pos[2] + sgn[q][0]*rz*0.5f + sgn[q][1]*uz*0.5f;
+            }
+            // Push lights out toward the viewer (player start position).
+            // Using TV-to-player direction is more reliable than guessing col-2
+            // orientation across different glTF exports.
+            float nx = 0.f         - g_tv_screen_pos[0];
+            float ny = 20.f        - g_tv_screen_pos[1]; // player eye-level
+            float nz = -80.f       - g_tv_screen_pos[2]; // player start Z
+            float nl = sqrtf(nx*nx + ny*ny + nz*nz);
+            if (nl > 0.f) { nx/=nl; ny/=nl; nz/=nl; }
+            g_tv_screen_normal[0]=nx; g_tv_screen_normal[1]=ny; g_tv_screen_normal[2]=nz;
+            const float push = 15.f;
+            for (int q=0;q<4;q++) {
+                g_tv_quad_pos[q][0] += nx*push;
+                g_tv_quad_pos[q][1] += ny*push;
+                g_tv_quad_pos[q][2] += nz*push;
+            }
+            printf("Screen outward normal: %.3f %.3f %.3f\n", nx, ny, nz);
         }
     load_room();
     init_crt();
@@ -1188,6 +1257,34 @@ static void update_player() {
     if (g_move[3]) { g_local.x += rt_x*speed; g_local.z += rt_z*speed; } // D
 }
 
+// Sample 4 screen quadrants from the raw frame buffer and average their colours.
+// These are passed to the shader as per-quadrant light colours each frame.
+static void sample_quad_colors() {
+    if (g_js_colors) return; // JS-driven mode (N64, guest stream) owns the colors
+    if (g_frame_rgba.empty() || g_frame_w == 0 || g_frame_h == 0) return;
+    int fw = (int)g_frame_w, fh = (int)g_frame_h;
+    // Quadrant pixel ranges (x0,x1,y0,y1) ordered to match g_tv_quad_pos:
+    //   q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
+    const int qx0[4] = {0,    fw/2, 0,    fw/2};
+    const int qx1[4] = {fw/2, fw,   fw/2, fw  };
+    const int qy0[4] = {fh/2, fh/2, 0,    0   };
+    const int qy1[4] = {fh,   fh,   fh/2, fh/2};
+    for (int q = 0; q < 4; q++) {
+        float r=0,g=0,b=0; int cnt=0;
+        for (int y=qy0[q]; y<qy1[q]; y+=4) {
+            for (int x=qx0[q]; x<qx1[q]; x+=4) {
+                const uint8_t* px = g_frame_rgba.data() + (y*fw+x)*4;
+                r+=px[0]; g+=px[1]; b+=px[2]; cnt++;
+            }
+        }
+        if (cnt > 0) {
+            g_tv_quad_col[q][0] = r / (cnt * 255.f);
+            g_tv_quad_col[q][1] = g / (cnt * 255.f);
+            g_tv_quad_col[q][2] = b / (cnt * 255.f);
+        }
+    }
+}
+
 static void render() {
     int w,h;
     emscripten_get_canvas_element_size("#canvas",&w,&h);
@@ -1210,7 +1307,21 @@ static void render() {
     glUseProgram(g_prog);
     glUniform1i(g_u_tex, 0);
     glUniform2f(g_u_overscan, g_overscan_x, g_overscan_y);
-    glUniform3fv(g_u_tv_pos,   1, g_tv_screen_pos);
+    float scaled_col[4][3];
+    for (int q=0;q<4;q++) for (int k=0;k<3;k++)
+        scaled_col[q][k] = g_tv_quad_col[q][k] * g_tv_light_intensity;
+    // Rotate base screen normal by yaw (Y-axis) and pitch (X-axis)
+    float yaw_r   = g_cone_yaw   * 3.14159265f / 180.f;
+    float pitch_r = g_cone_pitch * 3.14159265f / 180.f;
+    float cy=cosf(yaw_r), sy=sinf(yaw_r);
+    float bn0=g_tv_screen_normal[0], bn1=g_tv_screen_normal[1], bn2=g_tv_screen_normal[2];
+    float n0= cy*bn0 + sy*bn2, n1=bn1, n2=-sy*bn0 + cy*bn2; // yaw
+    float cp=cosf(pitch_r), sp=sinf(pitch_r);
+    float cone_dir[3] = { n0, cp*n1 - sp*n2, sp*n1 + cp*n2 }; // pitch
+    glUniform3fv(g_u_tv_quad_pos, 4, &g_tv_quad_pos[0][0]);
+    glUniform3fv(g_u_tv_quad_col, 4, &scaled_col[0][0]);
+    glUniform3fv(g_u_tv_normal,   1, cone_dir);
+    glUniform1f (g_u_cone_power,  g_cone_power);
     glUniform3fv(g_u_lamp_pos,       1, g_lamp_pos);
     glUniform1f (g_u_lamp_intensity, g_lamp_intensity);
 
@@ -1261,7 +1372,10 @@ static void render() {
         glUniform1i(g_skin_u_tex, 0);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_cat_tex);
-        glUniform3fv(g_skin_u_tv_pos,   1, g_tv_screen_pos);
+        glUniform3fv(g_skin_u_tv_quad_pos, 4, &g_tv_quad_pos[0][0]);
+        glUniform3fv(g_skin_u_tv_quad_col, 4, &scaled_col[0][0]);
+        glUniform3fv(g_skin_u_tv_normal,   1, cone_dir);
+        glUniform1f (g_skin_u_cone_power,  g_cone_power);
         glUniform3fv(g_skin_u_lamp_pos, 1, g_lamp_pos);
         glUniform1f (g_skin_u_lamp_intensity, g_lamp_intensity);
 
@@ -1371,6 +1485,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_pos(float x, float y, float z) {
 extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_intensity(float v) {
     g_lamp_intensity = v;
 }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_light_intensity(float v) {
+    g_tv_light_intensity = v;
+}
+// Set all 4 quadrant colours at once — used by JS-driven video modes
+// (N64, guest stream) where g_frame_rgba is never populated.
+extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_quad_colors(
+    float r0,float g0,float b0, float r1,float g1,float b1,
+    float r2,float g2,float b2, float r3,float g3,float b3) {
+    g_tv_quad_col[0][0]=r0; g_tv_quad_col[0][1]=g0; g_tv_quad_col[0][2]=b0;
+    g_tv_quad_col[1][0]=r1; g_tv_quad_col[1][1]=g1; g_tv_quad_col[1][2]=b1;
+    g_tv_quad_col[2][0]=r2; g_tv_quad_col[2][1]=g2; g_tv_quad_col[2][2]=b2;
+    g_tv_quad_col[3][0]=r3; g_tv_quad_col[3][1]=g3; g_tv_quad_col[3][2]=b3;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_js_colors(int v) { g_js_colors = (v != 0); }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_yaw(float v)   { g_cone_yaw   = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_pitch(float v) { g_cone_pitch = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cone_power(float v) { g_cone_power = v; }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_overscan(float x, float y) {
     g_overscan_x = x; g_overscan_y = y;
 }
@@ -1431,6 +1562,7 @@ static void loop() {
     update_player();
     if (g_running) retro_run();
     render_crt_pass();
+    sample_quad_colors();
     render();
 }
 

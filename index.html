@@ -69,12 +69,12 @@
   &nbsp; <span id="status">No ROM loaded</span>
   &nbsp;&nbsp;
   <label style="font:11px monospace;color:#aaa">Overscan X
-    <input type="range" id="overscan-x" min="0" max="0.15" step="0.005" value="0.04"
+    <input type="range" id="overscan-x" min="-0.3" max="0.4" step="0.005" value="0.04"
            style="width:80px;vertical-align:middle">
   </label>
   &nbsp;
   <label style="font:11px monospace;color:#aaa">Y
-    <input type="range" id="overscan-y" min="0" max="0.15" step="0.005" value="0.04"
+    <input type="range" id="overscan-y" min="-0.3" max="0.4" step="0.005" value="0.04"
            style="width:80px;vertical-align:middle">
   </label>
 </div>
@@ -116,6 +116,23 @@
   <label style="font:11px monospace;color:#aaa">Intensity
     <input type="range" id="lamp-intensity" min="0" max="12" step="0.1" value="1" style="width:80px;vertical-align:middle">
     <span id="lamp-intensity-val" style="color:#ccc">1</span>
+  </label>
+  &nbsp;&nbsp;
+  <span style="color:#888;font:11px monospace">TV:</span>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Emission
+    <input type="range" id="tv-intensity" min="0" max="8" step="0.1" value="1.7" style="width:80px;vertical-align:middle">
+    <span id="tv-intensity-val" style="color:#ccc">1.7</span>
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Cone Yaw°
+    <input type="number" id="cone-yaw" value="0" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Pitch°
+    <input type="number" id="cone-pitch" value="-362" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Power
+    <input type="number" id="cone-power" value="18.2" step="0.1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
   </label>
 </div>
 <div id="player-bar">
@@ -281,6 +298,30 @@ function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
 }
 
+// Sample a video source (canvas or video element) into 4 quadrant average
+// colours and write them directly into the C++ g_tv_quad_col buffer.
+// Used by N64 and guest-stream modes where g_frame_rgba is never populated.
+const _quadSampleCanvas = document.createElement('canvas');
+_quadSampleCanvas.width = 2; _quadSampleCanvas.height = 2;
+const _quadSampleCtx = _quadSampleCanvas.getContext('2d', { willReadFrequently: true });
+function jsUpdateQuadColors(source) {
+  if (!coreModule) return;
+  try {
+    _quadSampleCtx.drawImage(source, 0, 0, 2, 2);
+    const d = _quadSampleCtx.getImageData(0, 0, 2, 2).data;
+    // 2×2 pixel layout (canvas y=0 is top):
+    //   d[0..3]=TL  d[4..7]=TR  d[8..11]=BL  d[12..15]=BR
+    // Must match C++ quad order: q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
+    coreModule.ccall('set_tv_quad_colors', null,
+      ['number','number','number','number','number','number',
+       'number','number','number','number','number','number'],
+      [d[8]/255, d[9]/255, d[10]/255,    // q0 BL
+       d[12]/255,d[13]/255,d[14]/255,    // q1 BR
+       d[0]/255, d[1]/255, d[2]/255,     // q2 TL
+       d[4]/255, d[5]/255, d[6]/255]);   // q3 TR
+  } catch(e) { console.warn('jsUpdateQuadColors:', e); }
+}
+
 // Copy libretro frame from WASM heap → shareCanvas each animation frame.
 // Frames are scaled to fill the full 640×480 shareCanvas so the receiver
 // sees a full-TV image regardless of the core's native resolution.
@@ -320,6 +361,8 @@ function setupVideoReceive(stream) {
 
   const texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
   coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  // JS (jsUpdateQuadColors) owns the quad colors — skip C++ sampling from g_frame_rgba
+  coreModule.ccall('set_js_colors', 'void', ['number'], [1]);
   (function blitLoop() {
     if (videoEl.readyState >= 2 && frontendGL && frontendCtx) {
       const tex = frontendGL.textures[texId];
@@ -329,6 +372,7 @@ function setupVideoReceive(stream) {
           frontendCtx.RGBA, frontendCtx.RGBA, frontendCtx.UNSIGNED_BYTE, videoEl);
         frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
           frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
+        jsUpdateQuadColors(videoEl);
       }
     }
     requestAnimationFrame(blitLoop);
@@ -554,6 +598,8 @@ function loadN64(file) {
     var texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
     // Tell the CRT shader that the game texture is N64-sized, not GBC-sized
     coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+    // JS (jsUpdateQuadColors) owns the quad colors for N64 — skip C++ sampling
+    coreModule.ccall('set_js_colors', 'void', ['number'], [1]);
 
     setStatus('Loading N64 emulator...');
 
@@ -610,6 +656,7 @@ function loadN64(file) {
                 var tex = n64GL.textures[texId];
                 if (tex) {
                   blit2d.drawImage(n64canvas, 0, 0);
+                  jsUpdateQuadColors(blitCanvas);
                   n64Ctx.bindTexture(n64Ctx.TEXTURE_2D, tex);
                   n64Ctx.texImage2D(n64Ctx.TEXTURE_2D, 0,
                     n64Ctx.RGBA, n64Ctx.RGBA,
@@ -636,11 +683,7 @@ function loadN64(file) {
 canvas.addEventListener('click', () => canvas.requestPointerLock());
 
 document.addEventListener('pointerlockchange', () => {
-  if (document.pointerLockElement === canvas) {
-    overlay.classList.add('hidden');
-  } else {
-    overlay.classList.remove('hidden');
-  }
+  overlay.classList.add('hidden');
 });
 
 document.addEventListener('mousemove', e => {
@@ -732,6 +775,23 @@ function applyLampIntensity() {
   coreModule.ccall('set_lamp_intensity', null, ['number'], [v]);
 }
 document.getElementById('lamp-intensity').addEventListener('input', applyLampIntensity);
+
+function applyTvIntensity() {
+  if (!coreModule) return;
+  const v = parseFloat(document.getElementById('tv-intensity').value);
+  document.getElementById('tv-intensity-val').textContent = v;
+  coreModule.ccall('set_tv_light_intensity', null, ['number'], [v]);
+}
+document.getElementById('tv-intensity').addEventListener('input', applyTvIntensity);
+
+function applyConeParams() {
+  if (!coreModule) return;
+  coreModule.ccall('set_cone_yaw',   null, ['number'], [parseFloat(document.getElementById('cone-yaw').value)]);
+  coreModule.ccall('set_cone_pitch', null, ['number'], [parseFloat(document.getElementById('cone-pitch').value)]);
+  coreModule.ccall('set_cone_power', null, ['number'], [parseFloat(document.getElementById('cone-power').value)]);
+}
+['cone-yaw','cone-pitch','cone-power'].forEach(id =>
+  document.getElementById(id).addEventListener('input', applyConeParams));
 
 document.getElementById('my-y').addEventListener('input', function() {
   if (!coreModule) return;
