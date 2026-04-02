@@ -55,27 +55,68 @@ static void m4_lookat(M4 m, float ex,float ey,float ez,
     m[14]= (fx*ex+fy*ey+fz*ez);
 }
 
+static void m4_from_trs(M4 out, const float t[3], const float r[4], const float s[3]) {
+    float x=r[0],y=r[1],z=r[2],w=r[3];
+    float x2=x+x,y2=y+y,z2=z+z;
+    float xx=x*x2,xy=x*y2,xz=x*z2;
+    float yy=y*y2,yz=y*z2,zz=z*z2;
+    float wx=w*x2,wy=w*y2,wz=w*z2;
+    // column-major
+    out[0]=(1-(yy+zz))*s[0]; out[1]=(xy+wz)*s[0];  out[2]=(xz-wy)*s[0];  out[3]=0.f;
+    out[4]=(xy-wz)*s[1];     out[5]=(1-(xx+zz))*s[1]; out[6]=(yz+wx)*s[1]; out[7]=0.f;
+    out[8]=(xz+wy)*s[2];     out[9]=(yz-wx)*s[2];  out[10]=(1-(xx+yy))*s[2]; out[11]=0.f;
+    out[12]=t[0]; out[13]=t[1]; out[14]=t[2]; out[15]=1.f;
+}
+
+static void q_slerp(float* out, const float* a, const float* b, float t) {
+    float dot = a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];
+    float b2[4]={b[0],b[1],b[2],b[3]};
+    if (dot < 0.f) { dot=-dot; b2[0]=-b2[0];b2[1]=-b2[1];b2[2]=-b2[2];b2[3]=-b2[3]; }
+    if (dot > 0.9995f) {
+        for(int i=0;i<4;i++) out[i]=a[i]+(b2[i]-a[i])*t;
+        float l=sqrtf(out[0]*out[0]+out[1]*out[1]+out[2]*out[2]+out[3]*out[3]);
+        for(int i=0;i<4;i++) out[i]/=l;
+        return;
+    }
+    float th0=acosf(dot), th=th0*t;
+    float s0=sinf(th)/sinf(th0), sa=cosf(th)-dot*s0;
+    for(int i=0;i<4;i++) out[i]=sa*a[i]+s0*b2[i];
+}
+
 // ============================================================
 //  GL state
 // ============================================================
 struct TvPrim {
     GLuint vbo;
     int    vcount;
-    GLuint base_tex;  // 0 if none
-    bool   is_screen; // use game texture
+    GLuint base_tex;    // 0 if none
+    bool   is_screen;   // use game texture
+    bool   double_sided;
+    bool   is_room;     // part of room model — apply g_room_xform
     M4     world;
 };
 static std::vector<TvPrim> g_prims;
-static GLuint g_game_tex = 0;
+static GLuint g_game_tex   = 0;
+static GLuint g_white_tex  = 0;  // fallback for room prims with no texture
+
+// ── Room transform (tuned at runtime, hardcoded once locked in) ──────────────
+static float g_room_scale = 32.f;
+static float g_room_rot_y = -3.14159265f;   // radians (-180 deg)
+static float g_room_tx = 4.f, g_room_ty = 21.f, g_room_tz = 15.f;
 static GLuint g_prog     = 0;
 static int    g_a_pos=-1, g_a_uv=-1, g_a_norm=-1;
-static int    g_u_mvp=-1, g_u_model=-1, g_u_tex=-1, g_u_screen=-1;
+static int    g_u_mvp=-1, g_u_model=-1, g_u_tex=-1, g_u_screen=-1, g_u_overscan=-1, g_u_tv_pos=-1, g_u_lamp_pos=-1, g_u_lamp_intensity=-1;
+static float  g_overscan_x = 0.04f, g_overscan_y = 0.04f;
+static float  g_tv_screen_pos[3] = {0.f, 0.f, 0.f};
+static float  g_lamp_pos[3] = {0.f, -45.f, -260.f};
+static float  g_lamp_intensity = 1.0f;
+static float  g_cat_eye_height  = -35.f; // camera is at eye level; cat rendered this far below
 
 // ============================================================
 //  Player  (structured for future multiplayer)
 // ============================================================
 struct Player {
-    float x = 0.f, y = -40.f, z = -80.f; // world position (eye height)
+    float x = 0.f, y = 20.f, z = -80.f;  // world position (feet)
     float yaw = 0.f, pitch = 0.f;         // look angles (radians)
 };
 
@@ -85,12 +126,56 @@ struct RemotePlayer {
     float x = 0.f, y = -40.f, z = 0.f;
     float yaw = 0.f;
     bool  active = false;
+    bool  moving = false;
+    float anim_time = 0.f;
+    int   anim_idx  = 1; // idle
 };
 static RemotePlayer g_remote[8];
-static GLuint g_avatar_vbo = 0, g_avatar_tex = 0;
-static int    g_avatar_vcount = 0;
+// ── Cat skinned model ────────────────────────────────────────────────────────
+struct CatChannel {
+    int node, path; // path: 0=T, 1=R, 2=S
+    std::vector<float> times, values;
+};
+struct CatAnim {
+    float duration;
+    std::vector<CatChannel> channels;
+};
+static const int CAT_JOINTS = 29;
+static const int CAT_NODES  = 40; // slightly larger than 38 for safety
+static GLuint g_skin_prog  = 0;
+static GLuint g_cat_vbo    = 0;
+static GLuint g_cat_tex    = 0;
+static int    g_cat_vcount = 0;
+static int    g_cat_joint_nodes[CAT_JOINTS];
+static float  g_cat_inv_bind [CAT_JOINTS][16];
+static float  g_cat_bone_mats[CAT_JOINTS][16];
+static int    g_cat_node_parent  [CAT_NODES];
+static float  g_cat_node_def_t   [CAT_NODES][3];
+static float  g_cat_node_def_r   [CAT_NODES][4];
+static float  g_cat_node_def_s   [CAT_NODES][3];
+static float  g_cat_node_t       [CAT_NODES][3];
+static float  g_cat_node_r       [CAT_NODES][4];
+static float  g_cat_node_s       [CAT_NODES][3];
+static float  g_cat_node_global  [CAT_NODES][16];
+static std::vector<CatAnim> g_cat_anims;
+static int    g_cat_anim_idx = 1; // idle
+static float  g_cat_anim_time = 0.f;
+static int    g_cat_node_count = 0;
+static int    g_skin_u_vp=-1, g_skin_u_world=-1, g_skin_u_bones=-1;
+static int    g_skin_u_tex=-1, g_skin_u_tv_pos=-1;
+static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1;
+static int    g_skin_a_pos=-1, g_skin_a_uv=-1, g_skin_a_norm=-1;
+static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
 
 static bool g_move[4] = {};  // W S A D
+
+// ============================================================
+//  Audio ring buffer  (stereo int16, exposed to JS)
+// ============================================================
+static const int AUDIO_BUF = 16384 * 2;  // int16 units (16384 stereo frames)
+static int16_t   g_audio_buf[AUDIO_BUF];
+static int       g_audio_write = 0;
+static unsigned  g_audio_sample_rate = 44100;
 
 // ============================================================
 //  Frame buffer  (exposed to JS for video streaming)
@@ -163,8 +248,19 @@ void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch)
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
 }
 
-void   retro_audio_sample(int16_t,int16_t) {}
-size_t retro_audio_sample_batch(const int16_t*,size_t f) { return f; }
+void retro_audio_sample(int16_t l, int16_t r) {
+    g_audio_buf[g_audio_write] = l;
+    g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
+    g_audio_buf[g_audio_write] = r;
+    g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
+}
+size_t retro_audio_sample_batch(const int16_t* data, size_t frames) {
+    for (size_t i = 0; i < frames * 2; i++) {
+        g_audio_buf[g_audio_write] = data[i];
+        g_audio_write = (g_audio_write + 1) % AUDIO_BUF;
+    }
+    return frames;
+}
 void   retro_input_poll() {}
 int16_t retro_input_state(unsigned port,unsigned device,unsigned,unsigned id) {
     if (port||device!=RETRO_DEVICE_JOYPAD||id>=16) return 0;
@@ -196,30 +292,115 @@ attribute vec3 a_norm;
 uniform mat4 u_mvp;
 uniform mat4 u_model;
 varying vec2 v_uv;
-varying float v_ndotl;
+varying vec3 v_wpos;
+varying vec3 v_wnorm;
 void main() {
+    vec4 wp = u_model * vec4(a_pos, 1.0);
     gl_Position = u_mvp * vec4(a_pos, 1.0);
-    v_uv = a_uv;
-    vec3 wn = normalize(vec3(u_model * vec4(a_norm, 0.0)));
-    vec3 light = normalize(vec3(0.5, -1.0, 0.8));
-    v_ndotl = max(dot(wn, light), 0.0);
+    v_uv   = a_uv;
+    v_wpos = wp.xyz;
+    v_wnorm = normalize(vec3(u_model * vec4(a_norm, 0.0)));
 }
 )";
 
 static const char* FS = R"(
 precision mediump float;
 varying vec2 v_uv;
-varying float v_ndotl;
+varying vec3 v_wpos;
+varying vec3 v_wnorm;
 uniform sampler2D u_tex;
-uniform float u_screen;  // 1.0 = screen (emissive), 0.0 = normal
+uniform float u_screen;   // 1.0 = screen (emissive), 0.0 = normal
+uniform vec2 u_overscan;  // per-axis overscan factor (0 = none, 0.05 = 5%)
+uniform vec3 u_tv_pos;    // world-space centre of TV screen
+uniform vec3  u_lamp_pos;       // world-space position of interior lamp
+uniform float u_lamp_intensity; // brightness multiplier
+
 void main() {
-    vec4 col = texture2D(u_tex, v_uv);
     if (u_screen > 0.5) {
-        gl_FragColor = texture2D(u_tex, vec2(1.0 - v_uv.x, v_uv.y));
+        // Flip X, then zoom in by overscan so image bleeds behind the bezel
+        vec2 uv = vec2(1.0 - v_uv.x, v_uv.y);
+        uv = uv * (1.0 - 2.0 * u_overscan) + u_overscan;
+        gl_FragColor = texture2D(u_tex, uv);
     } else {
-        float light = 0.35 + v_ndotl * 0.65;
-        gl_FragColor = vec4(col.rgb * light, col.a);
+        vec3 n = normalize(v_wnorm);
+        vec3 albedo = texture2D(u_tex, v_uv).rgb;
+
+        // ── Interior ceiling lamp (point light, position set via u_lamp_pos) ─
+        vec3 to_lamp  = u_lamp_pos - v_wpos;
+        float lamp_dist  = length(to_lamp);
+        float lamp_ndotl = max(dot(n, to_lamp / lamp_dist), 0.0);
+        float lamp_atten = 1.0 / (1.0 + lamp_dist * lamp_dist * 0.000022);
+        vec3 lamp = vec3(1.0, 0.84, 0.55) * lamp_ndotl * lamp_atten * u_lamp_intensity;
+
+        // ── TV screen glow (point light, cool blue-white) ──────────────────
+        vec3 to_tv   = u_tv_pos - v_wpos;
+        float tv_dist   = length(to_tv);
+        float tv_ndotl  = max(dot(n, to_tv / tv_dist), 0.0);
+        float tv_atten  = 1.0 / (1.0 + tv_dist * tv_dist * 0.00028);
+        vec3 tv_glow    = vec3(0.50, 0.62, 1.0) * tv_ndotl * tv_atten * 2.2;
+
+        // ── Very low warm ambient ───────────────────────────────────────────
+        vec3 ambient = vec3(0.07, 0.052, 0.034);
+
+        vec3 lighting = ambient + lamp + tv_glow;
+        gl_FragColor = vec4(albedo * lighting, 1.0);
     }
+}
+)";
+
+// ============================================================
+//  Skinned-mesh shaders (GLSL ES 3.00 / WebGL2)
+// ============================================================
+static const char* SKIN_VS = R"(#version 300 es
+in vec3 a_pos;
+in vec2 a_uv;
+in vec3 a_norm;
+in vec4 a_joints;
+in vec4 a_weights;
+uniform mat4 u_vp;
+uniform mat4 u_world;
+uniform mat4 u_bones[29];
+out vec2 v_uv;
+out vec3 v_wpos;
+out vec3 v_wnorm;
+void main() {
+    mat4 skin = a_weights.x * u_bones[int(a_joints.x)]
+              + a_weights.y * u_bones[int(a_joints.y)]
+              + a_weights.z * u_bones[int(a_joints.z)]
+              + a_weights.w * u_bones[int(a_joints.w)];
+    vec4 wp = u_world * skin * vec4(a_pos, 1.0);
+    gl_Position = u_vp * wp;
+    v_uv    = a_uv;
+    v_wpos  = wp.xyz;
+    v_wnorm = normalize(mat3(u_world) * mat3(skin) * a_norm);
+}
+)";
+
+static const char* SKIN_FS = R"(#version 300 es
+precision mediump float;
+in vec2  v_uv;
+in vec3  v_wpos;
+in vec3  v_wnorm;
+uniform sampler2D u_tex;
+uniform vec3  u_tv_pos;
+uniform vec3  u_lamp_pos;
+uniform float u_lamp_intensity;
+out vec4 fragColor;
+void main() {
+    vec3 n = normalize(v_wnorm);
+    vec3 albedo = texture(u_tex, v_uv).rgb;
+    vec3 to_lamp  = u_lamp_pos - v_wpos;
+    float ld = length(to_lamp);
+    float lamp_ndotl = max(dot(n, to_lamp/ld), 0.0);
+    float lamp_atten = 1.0/(1.0+ld*ld*0.000022);
+    vec3 lamp = vec3(1.0,0.84,0.55)*lamp_ndotl*lamp_atten*u_lamp_intensity;
+    vec3 to_tv = u_tv_pos - v_wpos;
+    float td = length(to_tv);
+    float tv_ndotl = max(dot(n, to_tv/td), 0.0);
+    float tv_atten = 1.0/(1.0+td*td*0.00028);
+    vec3 tv_glow = vec3(0.50,0.62,1.0)*tv_ndotl*tv_atten*2.2;
+    vec3 ambient = vec3(0.07,0.052,0.034);
+    fragColor = vec4(albedo*(ambient+lamp+tv_glow), 1.0);
 }
 )";
 
@@ -451,7 +632,29 @@ static GLuint load_tex(const char* path) {
     GLuint t; glGenTextures(1,&t);
     glBindTexture(GL_TEXTURE_2D,t);
     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
-    glGenerateMipmap(GL_TEXTURE_2D);
+    glGenerateMipmap(GL_TEXTURE_2D);  // WebGL2: NPOT mipmaps are fine
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
+    stbi_image_free(px);
+    return t;
+}
+
+// Load texture from an already-decoded buffer view (embedded GLTF images)
+static GLuint load_tex_bv(cgltf_buffer_view* bv) {
+    if (!bv || !bv->buffer->data) return 0;
+    const uint8_t* d = (const uint8_t*)bv->buffer->data + bv->offset;
+    int w,h,ch;
+    uint8_t* px = stbi_load_from_memory(d,(int)bv->size,&w,&h,&ch,4);
+    if (!px) {
+        printf("load_tex_bv: stbi failed (size=%zu, reason=%s)\n", bv->size, stbi_failure_reason());
+        return 0;
+    }
+    GLuint t; glGenTextures(1,&t);
+    glBindTexture(GL_TEXTURE_2D,t);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,px);
+    glGenerateMipmap(GL_TEXTURE_2D);  // WebGL2: NPOT mipmaps are fine
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
@@ -519,15 +722,251 @@ static void load_tv() {
             }
 
             TvPrim tp;
-            tp.vbo       = vbo;
-            tp.vcount    = (int)pos_acc->count;
-            tp.base_tex  = base_tex;
-            tp.is_screen = is_screen;
+            tp.vbo          = vbo;
+            tp.vcount       = (int)pos_acc->count;
+            tp.base_tex     = base_tex;
+            tp.is_screen    = is_screen;
+            tp.double_sided = false;
+            tp.is_room      = false;
             memcpy(tp.world, world, sizeof(M4));
             g_prims.push_back(tp);
         }
     }
     printf("Loaded %zu TV primitives\n", g_prims.size());
+    cgltf_free(gltf);
+}
+
+static void load_room() {
+    cgltf_options opts = {};
+    cgltf_data* gltf = nullptr;
+    cgltf_result r = cgltf_parse_file(&opts, "/tv/crt_room_full.gltf", &gltf);
+    if (r != cgltf_result_success) { printf("crt_room_full.gltf parse failed: %d\n",r); return; }
+    r = cgltf_load_buffers(&opts, gltf, "/tv/crt_room_full.gltf");
+    if (r != cgltf_result_success) { printf("room.gltf load_buffers failed: %d\n",r); return; }
+
+    // Cache textures by image index — many primitives share the same images
+    std::vector<GLuint> tex_cache(gltf->images_count, 0);
+    auto get_tex = [&](cgltf_image* img) -> GLuint {
+        int idx = (int)(img - gltf->images);
+        if (tex_cache[idx]) return tex_cache[idx];
+        GLuint t = img->buffer_view ? load_tex_bv(img->buffer_view) : 0;
+        if (!t && img->uri) {
+            char path[256]; snprintf(path,sizeof(path),"/tv/%s",img->uri);
+            t = load_tex(path);
+        }
+        tex_cache[idx] = t;
+        return t;
+    };
+
+    for (cgltf_size ni = 0; ni < gltf->nodes_count; ni++) {
+        cgltf_node* node = &gltf->nodes[ni];
+        if (!node->mesh) continue;
+
+        M4 world;
+        cgltf_node_transform_world(node, world);
+        // SketchUp export is upside-down relative to our scene — same Y-flip as TV
+        world[1]=-world[1]; world[5]=-world[5]; world[9]=-world[9]; world[13]=-world[13];
+
+        for (cgltf_size pi = 0; pi < node->mesh->primitives_count; pi++) {
+            cgltf_primitive* prim = &node->mesh->primitives[pi];
+            if (prim->type != cgltf_primitive_type_triangles || !prim->indices) continue;
+
+            cgltf_accessor *pos_acc=nullptr, *uv_acc=nullptr, *norm_acc=nullptr;
+            for (cgltf_size ai=0; ai<prim->attributes_count; ai++) {
+                auto& a = prim->attributes[ai];
+                if (a.type==cgltf_attribute_type_position) pos_acc=a.data;
+                if (a.type==cgltf_attribute_type_texcoord && a.index==0) uv_acc=a.data;
+                if (a.type==cgltf_attribute_type_normal)   norm_acc=a.data;
+            }
+            if (!pos_acc) continue;
+
+            // Expand indexed geometry into interleaved flat list (pos+uv+norm = 8 floats)
+            size_t idx_count = prim->indices->count;
+            std::vector<float> vdata;
+            vdata.reserve(idx_count * 8);
+            for (size_t i = 0; i < idx_count; i++) {
+                unsigned int idx = 0;
+                cgltf_accessor_read_uint(prim->indices, i, &idx, 1);
+                float p[3]={0,0,0}, u[2]={0,0}, n[3]={0,1,0};
+                cgltf_accessor_read_float(pos_acc, idx, p, 3);
+                if (uv_acc)   cgltf_accessor_read_float(uv_acc,   idx, u, 2);
+                if (norm_acc) cgltf_accessor_read_float(norm_acc, idx, n, 3);
+                vdata.insert(vdata.end(), {p[0],p[1],p[2], u[0],u[1], n[0],n[1],n[2]});
+            }
+
+            GLuint vbo; glGenBuffers(1,&vbo);
+            glBindBuffer(GL_ARRAY_BUFFER,vbo);
+            glBufferData(GL_ARRAY_BUFFER,(GLsizeiptr)(vdata.size()*4),vdata.data(),GL_STATIC_DRAW);
+
+            // Resolve texture from material
+            GLuint base_tex = 0;
+            if (prim->material) {
+                auto& pbr = prim->material->pbr_metallic_roughness;
+                if (pbr.base_color_texture.texture && pbr.base_color_texture.texture->image) {
+                    base_tex = get_tex(pbr.base_color_texture.texture->image);
+                } else {
+                    // Factor-only material: bake into a 1×1 colour texture
+                    float* cf = pbr.base_color_factor;
+                    uint8_t col[4]={(uint8_t)(cf[0]*255),(uint8_t)(cf[1]*255),
+                                    (uint8_t)(cf[2]*255),255};
+                    glGenTextures(1,&base_tex);
+                    glBindTexture(GL_TEXTURE_2D,base_tex);
+                    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,col);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                }
+            }
+
+            TvPrim tp;
+            tp.vbo         = vbo;
+            tp.vcount      = (int)idx_count;
+            tp.base_tex    = base_tex;
+            tp.is_screen   = false;
+            tp.double_sided = prim->material && prim->material->double_sided;
+            tp.is_room     = true;
+            memcpy(tp.world, world, sizeof(M4));
+            g_prims.push_back(tp);
+        }
+    }
+    // Print room accessor bounds to help align with TV coordinate space
+    if (gltf->accessors_count > 0) {
+        for (cgltf_size i = 0; i < gltf->accessors_count; i++) {
+            cgltf_accessor* a = &gltf->accessors[i];
+            if (a->type == cgltf_type_vec3 && a->has_min && a->has_max) {
+                printf("Room VEC3 bounds: min(%.2f %.2f %.2f) max(%.2f %.2f %.2f)\n",
+                    a->min[0],a->min[1],a->min[2], a->max[0],a->max[1],a->max[2]);
+                break;
+            }
+        }
+    }
+    printf("Room loaded, total prims: %zu\n", g_prims.size());
+    cgltf_free(gltf);
+}
+
+static void load_cat() {
+    cgltf_options opts = {};
+    cgltf_data* gltf = nullptr;
+    cgltf_result r = cgltf_parse_file(&opts, "/tv/cat/scene.gltf", &gltf);
+    if (r != cgltf_result_success) { printf("cat: cgltf_parse_file failed %d\n", r); return; }
+    r = cgltf_load_buffers(&opts, gltf, "/tv/cat/scene.gltf");
+    if (r != cgltf_result_success) { printf("cat: cgltf_load_buffers failed %d\n", r); cgltf_free(gltf); return; }
+
+    g_cat_node_count = (int)gltf->nodes_count;
+
+    // ── Node hierarchy + default TRS ─────────────────────────────────────────
+    for (int ni = 0; ni < g_cat_node_count; ni++) g_cat_node_parent[ni] = -1;
+    for (int ni = 0; ni < g_cat_node_count; ni++) {
+        cgltf_node* n = &gltf->nodes[ni];
+        for (cgltf_size ci = 0; ci < n->children_count; ci++)
+            g_cat_node_parent[(int)(n->children[ci]-gltf->nodes)] = ni;
+    }
+    for (int ni = 0; ni < g_cat_node_count; ni++) {
+        cgltf_node* n = &gltf->nodes[ni];
+        if (n->has_translation) memcpy(g_cat_node_def_t[ni], n->translation, 12);
+        else { g_cat_node_def_t[ni][0]=0; g_cat_node_def_t[ni][1]=0; g_cat_node_def_t[ni][2]=0; }
+        if (n->has_rotation) memcpy(g_cat_node_def_r[ni], n->rotation, 16);
+        else { g_cat_node_def_r[ni][0]=0; g_cat_node_def_r[ni][1]=0; g_cat_node_def_r[ni][2]=0; g_cat_node_def_r[ni][3]=1; }
+        if (n->has_scale) memcpy(g_cat_node_def_s[ni], n->scale, 12);
+        else { g_cat_node_def_s[ni][0]=1; g_cat_node_def_s[ni][1]=1; g_cat_node_def_s[ni][2]=1; }
+    }
+
+    // ── Skin ─────────────────────────────────────────────────────────────────
+    cgltf_skin* skin = &gltf->skins[0];
+    for (int j = 0; j < CAT_JOINTS; j++)
+        g_cat_joint_nodes[j] = (int)(skin->joints[j] - gltf->nodes);
+    if (skin->inverse_bind_matrices) {
+        for (int j = 0; j < CAT_JOINTS; j++)
+            cgltf_accessor_read_float(skin->inverse_bind_matrices, j, g_cat_inv_bind[j], 16);
+    } else {
+        for (int j = 0; j < CAT_JOINTS; j++) { m4_identity(g_cat_inv_bind[j]); }
+    }
+
+    // ── Mesh VBO (expand indices → flat list) ────────────────────────────────
+    cgltf_primitive* prim = &gltf->meshes[0].primitives[0];
+    cgltf_accessor *pos_acc=nullptr,*uv_acc=nullptr,*norm_acc=nullptr,*joints_acc=nullptr,*weights_acc=nullptr;
+    for (cgltf_size ai = 0; ai < prim->attributes_count; ai++) {
+        cgltf_attribute& at = prim->attributes[ai];
+        if (at.type==cgltf_attribute_type_position)                         pos_acc=at.data;
+        if (at.type==cgltf_attribute_type_texcoord && at.index==0)          uv_acc=at.data;
+        if (at.type==cgltf_attribute_type_normal)                           norm_acc=at.data;
+        if (at.type==cgltf_attribute_type_joints  && at.index==0)          joints_acc=at.data;
+        if (at.type==cgltf_attribute_type_weights && at.index==0)          weights_acc=at.data;
+    }
+    int icount = (int)prim->indices->count;
+    std::vector<float> vdata(icount * 16);
+    for (int ii = 0; ii < icount; ii++) {
+        unsigned idx = 0; cgltf_accessor_read_uint(prim->indices, ii, &idx, 1);
+        float* dst = &vdata[ii*16];
+        if (pos_acc)     cgltf_accessor_read_float(pos_acc,    idx, dst+0,  3); else {dst[0]=dst[1]=dst[2]=0;}
+        if (uv_acc)      cgltf_accessor_read_float(uv_acc,     idx, dst+3,  2); else {dst[3]=dst[4]=0;}
+        if (norm_acc)    cgltf_accessor_read_float(norm_acc,   idx, dst+5,  3); else {dst[5]=0;dst[6]=1;dst[7]=0;}
+        if (joints_acc)  { unsigned ji[4]={0,0,0,0}; cgltf_accessor_read_uint(joints_acc, idx, ji, 4);
+                           dst[8]=(float)ji[0];dst[9]=(float)ji[1];dst[10]=(float)ji[2];dst[11]=(float)ji[3]; }
+        if (weights_acc) cgltf_accessor_read_float(weights_acc, idx, dst+12, 4);
+    }
+    g_cat_vcount = icount;
+    glGenBuffers(1, &g_cat_vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, g_cat_vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vdata.size()*4), vdata.data(), GL_STATIC_DRAW);
+
+    // ── Texture ───────────────────────────────────────────────────────────────
+    g_cat_tex = load_tex("/tv/cat/textures/heheBanana_baseColor.png");
+    if (!g_cat_tex) { printf("cat: texture not found\n"); }
+
+    // ── Animations ───────────────────────────────────────────────────────────
+    for (cgltf_size ai = 0; ai < gltf->animations_count; ai++) {
+        cgltf_animation* ca = &gltf->animations[ai];
+        CatAnim anim; anim.duration = 0.f;
+        for (cgltf_size si = 0; si < ca->samplers_count; si++) {
+            float last = 0.f;
+            cgltf_accessor_read_float(ca->samplers[si].input, ca->samplers[si].input->count-1, &last, 1);
+            if (last > anim.duration) anim.duration = last;
+        }
+        for (cgltf_size ci = 0; ci < ca->channels_count; ci++) {
+            cgltf_animation_channel* ch = &ca->channels[ci];
+            int path = -1;
+            if (ch->target_path == cgltf_animation_path_type_translation) path=0;
+            else if (ch->target_path == cgltf_animation_path_type_rotation)    path=1;
+            else if (ch->target_path == cgltf_animation_path_type_scale)       path=2;
+            if (path < 0) continue;
+            CatChannel chan;
+            chan.node = (int)(ch->target_node - gltf->nodes);
+            chan.path = path;
+            cgltf_accessor* inp = ch->sampler->input;
+            chan.times.resize(inp->count);
+            for (cgltf_size k=0;k<inp->count;k++) cgltf_accessor_read_float(inp,k,&chan.times[k],1);
+            cgltf_accessor* out = ch->sampler->output;
+            int comp = (path==1)?4:3;
+            chan.values.resize(out->count*comp);
+            for (cgltf_size k=0;k<out->count;k++) cgltf_accessor_read_float(out,k,&chan.values[k*comp],comp);
+            anim.channels.push_back(std::move(chan));
+        }
+        g_cat_anims.push_back(std::move(anim));
+    }
+    printf("cat: %d joints, %d verts, %zu anims\n", CAT_JOINTS, g_cat_vcount, g_cat_anims.size());
+
+    // ── Shader ────────────────────────────────────────────────────────────────
+    GLuint vs=make_shader(GL_VERTEX_SHADER,SKIN_VS);
+    GLuint fs=make_shader(GL_FRAGMENT_SHADER,SKIN_FS);
+    g_skin_prog=glCreateProgram();
+    glAttachShader(g_skin_prog,vs); glAttachShader(g_skin_prog,fs);
+    glLinkProgram(g_skin_prog);
+    { GLint ok; glGetProgramiv(g_skin_prog,GL_LINK_STATUS,&ok);
+      if(!ok){char buf[512];glGetProgramInfoLog(g_skin_prog,512,nullptr,buf);printf("skin link error: %s\n",buf);} }
+    glDeleteShader(vs); glDeleteShader(fs);
+    g_skin_u_vp    =glGetUniformLocation(g_skin_prog,"u_vp");
+    g_skin_u_world =glGetUniformLocation(g_skin_prog,"u_world");
+    g_skin_u_bones =glGetUniformLocation(g_skin_prog,"u_bones");
+    g_skin_u_tex   =glGetUniformLocation(g_skin_prog,"u_tex");
+    g_skin_u_tv_pos=glGetUniformLocation(g_skin_prog,"u_tv_pos");
+    g_skin_u_lamp_pos=glGetUniformLocation(g_skin_prog,"u_lamp_pos");
+    g_skin_u_lamp_intensity=glGetUniformLocation(g_skin_prog,"u_lamp_intensity");
+    g_skin_a_pos    =glGetAttribLocation(g_skin_prog,"a_pos");
+    g_skin_a_uv     =glGetAttribLocation(g_skin_prog,"a_uv");
+    g_skin_a_norm   =glGetAttribLocation(g_skin_prog,"a_norm");
+    g_skin_a_joints =glGetAttribLocation(g_skin_prog,"a_joints");
+    g_skin_a_weights=glGetAttribLocation(g_skin_prog,"a_weights");
+
     cgltf_free(gltf);
 }
 
@@ -629,7 +1068,11 @@ static void gl_init() {
     g_u_mvp   =glGetUniformLocation(g_prog,"u_mvp");
     g_u_model =glGetUniformLocation(g_prog,"u_model");
     g_u_tex   =glGetUniformLocation(g_prog,"u_tex");
-    g_u_screen=glGetUniformLocation(g_prog,"u_screen");
+    g_u_screen  =glGetUniformLocation(g_prog,"u_screen");
+    g_u_overscan=glGetUniformLocation(g_prog,"u_overscan");
+    g_u_tv_pos  =glGetUniformLocation(g_prog,"u_tv_pos");
+    g_u_lamp_pos      =glGetUniformLocation(g_prog,"u_lamp_pos");
+    g_u_lamp_intensity=glGetUniformLocation(g_prog,"u_lamp_intensity");
 
     // Game texture (1×1 placeholder until first frame)
     glGenTextures(1,&g_game_tex);
@@ -646,50 +1089,92 @@ static void gl_init() {
     glFrontFace(GL_CW);  // Y-flip correction reverses winding order
 
     load_tv();
+    for (const auto& p : g_prims)
+        if (p.is_screen) {
+            g_tv_screen_pos[0] = p.world[12];
+            g_tv_screen_pos[1] = p.world[13];
+            g_tv_screen_pos[2] = p.world[14];
+            printf("TV screen world pos: %.2f %.2f %.2f\n", p.world[12], p.world[13], p.world[14]);
+        }
+    load_room();
     init_crt();
 
-    // ── Avatar box mesh (10×30×8, pos+uv+norm = 8 floats / vertex) ──────────
+    // 1×1 white fallback texture (used for room prims with no material/texture)
     {
-        const float hw=5.f, hh=15.f, hd=4.f;
-        std::vector<float> v;
-        auto push = [&](float px,float py,float pz,
-                        float u, float fv,
-                        float nx,float ny,float nz) {
-            v.insert(v.end(),{px,py,pz,u,fv,nx,ny,nz});
-        };
-        auto quad = [&](float nx,float ny,float nz,
-                        float ax,float ay,float az,
-                        float bx,float by,float bz,
-                        float cx,float cy,float cz,
-                        float dx,float dy,float dz) {
-            push(ax,ay,az,0,0,nx,ny,nz); push(bx,by,bz,1,0,nx,ny,nz); push(cx,cy,cz,1,1,nx,ny,nz);
-            push(ax,ay,az,0,0,nx,ny,nz); push(cx,cy,cz,1,1,nx,ny,nz); push(dx,dy,dz,0,1,nx,ny,nz);
-        };
-        quad( 1,0,0,  hw,-hh, hd,  hw, hh, hd,  hw, hh,-hd,  hw,-hh,-hd);
-        quad(-1,0,0, -hw,-hh,-hd, -hw, hh,-hd, -hw, hh, hd, -hw,-hh, hd);
-        quad(0, 1,0, -hw, hh,-hd,  hw, hh,-hd,  hw, hh, hd, -hw, hh, hd);
-        quad(0,-1,0, -hw,-hh, hd,  hw,-hh, hd,  hw,-hh,-hd, -hw,-hh,-hd);
-        quad(0,0, 1, -hw,-hh, hd, -hw, hh, hd,  hw, hh, hd,  hw,-hh, hd);
-        quad(0,0,-1,  hw,-hh,-hd,  hw, hh,-hd, -hw, hh,-hd, -hw,-hh,-hd);
-        g_avatar_vcount = (int)(v.size() / 8);
-        glGenBuffers(1, &g_avatar_vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
-        glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(v.size()*sizeof(float)), v.data(), GL_STATIC_DRAW);
-    }
-    // 1×1 cyan texture for avatars
-    {
-        glGenTextures(1, &g_avatar_tex);
-        glBindTexture(GL_TEXTURE_2D, g_avatar_tex);
-        uint8_t cyan[4]={0,190,255,255};
-        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,cyan);
+        glGenTextures(1, &g_white_tex);
+        glBindTexture(GL_TEXTURE_2D, g_white_tex);
+        uint8_t white[4]={255,255,255,255};
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,1,1,0,GL_RGBA,GL_UNSIGNED_BYTE,white);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
     }
+    load_cat();
 }
 
 // ============================================================
 //  Render
 // ============================================================
+static void update_cat_anim(int anim_idx, float anim_time) {
+    if (g_cat_anims.empty() || anim_idx < 0 || anim_idx >= (int)g_cat_anims.size()) return;
+    CatAnim& anim = g_cat_anims[anim_idx];
+
+    // Reset to default pose
+    for (int ni=0;ni<g_cat_node_count;ni++){
+        memcpy(g_cat_node_t[ni],g_cat_node_def_t[ni],12);
+        memcpy(g_cat_node_r[ni],g_cat_node_def_r[ni],16);
+        memcpy(g_cat_node_s[ni],g_cat_node_def_s[ni],12);
+    }
+
+    // Sample channels
+    for (const CatChannel& ch : anim.channels) {
+        int n=ch.node; if(n<0||n>=g_cat_node_count) continue;
+        int kc=(int)ch.times.size(); if(kc==0) continue;
+        int lo=kc-1;
+        for(int k=0;k<kc;k++){ if(ch.times[k]>anim_time){lo=k-1;break;} }
+        if(lo<0)lo=0;
+        int hi=(lo+1<kc)?lo+1:lo;
+        float t=0.f;
+        if(hi!=lo) t=(anim_time-ch.times[lo])/(ch.times[hi]-ch.times[lo]);
+        if(t<0.f)t=0.f; if(t>1.f)t=1.f;
+        if(ch.path==0){
+            const float*a=&ch.values[lo*3],*b=&ch.values[hi*3];
+            g_cat_node_t[n][0]=a[0]+(b[0]-a[0])*t;
+            g_cat_node_t[n][1]=a[1]+(b[1]-a[1])*t;
+            g_cat_node_t[n][2]=a[2]+(b[2]-a[2])*t;
+        } else if(ch.path==1){
+            q_slerp(g_cat_node_r[n],&ch.values[lo*4],&ch.values[hi*4],t);
+        } else {
+            const float*a=&ch.values[lo*3],*b=&ch.values[hi*3];
+            g_cat_node_s[n][0]=a[0]+(b[0]-a[0])*t;
+            g_cat_node_s[n][1]=a[1]+(b[1]-a[1])*t;
+            g_cat_node_s[n][2]=a[2]+(b[2]-a[2])*t;
+        }
+    }
+
+    // Compute global transforms (nodes are parent-before-child in glTF)
+    bool done[CAT_NODES]={};
+    int left=g_cat_node_count;
+    while(left>0){
+        int prev=left;
+        for(int ni=0;ni<g_cat_node_count;ni++){
+            if(done[ni]) continue;
+            int p=g_cat_node_parent[ni];
+            if(p>=0&&!done[p]) continue;
+            M4 local; m4_from_trs(local,g_cat_node_t[ni],g_cat_node_r[ni],g_cat_node_s[ni]);
+            if(p<0) memcpy(g_cat_node_global[ni],local,64);
+            else    m4_mul(g_cat_node_global[ni],g_cat_node_global[p],local);
+            done[ni]=true; left--;
+        }
+        if(left==prev) break;
+    }
+
+    // Compute bone matrices = global[joint] * inv_bind[j]
+    for(int j=0;j<CAT_JOINTS;j++){
+        M4 bone; m4_mul(bone, g_cat_node_global[g_cat_joint_nodes[j]], g_cat_inv_bind[j]);
+        memcpy(g_cat_bone_mats[j],bone,64);
+    }
+}
+
 static void update_player() {
     const float speed = 0.8f;
     float fw_x = sinf(g_local.yaw);
@@ -711,27 +1196,48 @@ static void render() {
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
 
     // First-person camera from local player
+    // g_local.y is feet/floor position; g_cat_eye_height lifts camera to head level
+    float eye_y = g_local.y + g_cat_eye_height;
     float tx = g_local.x + cosf(g_local.pitch) * sinf(g_local.yaw);
-    float ty = g_local.y + sinf(g_local.pitch);
+    float ty = eye_y + sinf(g_local.pitch);
     float tz = g_local.z + cosf(g_local.pitch) * cosf(g_local.yaw);
 
     M4 proj, view, vp;
     m4_persp(proj, 1.0f, (float)w/h, 0.5f, 1000.f);
-    m4_lookat(view, g_local.x, g_local.y, g_local.z, tx, ty, tz);
+    m4_lookat(view, g_local.x, eye_y, g_local.z, tx, ty, tz);
     m4_mul(vp, proj, view);
 
     glUseProgram(g_prog);
     glUniform1i(g_u_tex, 0);
+    glUniform2f(g_u_overscan, g_overscan_x, g_overscan_y);
+    glUniform3fv(g_u_tv_pos,   1, g_tv_screen_pos);
+    glUniform3fv(g_u_lamp_pos,       1, g_lamp_pos);
+    glUniform1f (g_u_lamp_intensity, g_lamp_intensity);
+
+    // Pre-build room parent matrix from live tuning params (scale + Y-rot + translate)
+    M4 g_room_parent;
+    {
+        float s = g_room_scale;
+        float c = cosf(g_room_rot_y), sr = sinf(g_room_rot_y);
+        g_room_parent[0] = s*c;  g_room_parent[1] = 0.f; g_room_parent[2] =-s*sr; g_room_parent[3] = 0.f;
+        g_room_parent[4] = 0.f;  g_room_parent[5] = s;   g_room_parent[6] = 0.f;  g_room_parent[7] = 0.f;
+        g_room_parent[8] = s*sr; g_room_parent[9] = 0.f; g_room_parent[10]= s*c;  g_room_parent[11]= 0.f;
+        g_room_parent[12]= g_room_tx; g_room_parent[13]= g_room_ty;
+        g_room_parent[14]= g_room_tz; g_room_parent[15]= 1.f;
+    }
 
     for (auto& p : g_prims) {
-        M4 mvp;
-        m4_mul(mvp, vp, p.world);
+        M4 world, mvp;
+        if (p.is_room) { m4_mul(world, g_room_parent, p.world); }
+        else           { memcpy(world, p.world, sizeof(M4)); }
+        m4_mul(mvp, vp, world);
         glUniformMatrix4fv(g_u_mvp,   1, GL_FALSE, mvp);
-        glUniformMatrix4fv(g_u_model, 1, GL_FALSE, p.world);
+        glUniformMatrix4fv(g_u_model, 1, GL_FALSE, world);
         glUniform1f(g_u_screen, p.is_screen ? 1.f : 0.f);
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, p.is_screen ? g_crt_tex : p.base_tex);
+        GLuint tex = p.is_screen ? g_crt_tex : (p.base_tex ? p.base_tex : g_white_tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
 
         glBindBuffer(GL_ARRAY_BUFFER, p.vbo);
         // Interleaved layout: pos(12) + uv(8) + normal(12) = stride 32
@@ -744,41 +1250,66 @@ static void render() {
             glVertexAttribPointer(g_a_norm,3,GL_FLOAT,GL_FALSE,32,(void*)20);
         }
 
+        if (p.double_sided) glDisable(GL_CULL_FACE);
         glDrawArrays(GL_TRIANGLES, 0, p.vcount);
+        if (p.double_sided) glEnable(GL_CULL_FACE);
     }
 
-    // ── Remote player avatars ────────────────────────────────────────────────
-    if (g_avatar_vbo) {
-        glBindBuffer(GL_ARRAY_BUFFER, g_avatar_vbo);
-        glEnableVertexAttribArray(g_a_pos);
-        glVertexAttribPointer(g_a_pos, 3,GL_FLOAT,GL_FALSE,32,(void*)0);
-        glEnableVertexAttribArray(g_a_uv);
-        glVertexAttribPointer(g_a_uv,  2,GL_FLOAT,GL_FALSE,32,(void*)12);
-        if (g_a_norm>=0) {
-            glEnableVertexAttribArray(g_a_norm);
-            glVertexAttribPointer(g_a_norm,3,GL_FLOAT,GL_FALSE,32,(void*)20);
-        }
-        glUniform1f(g_u_screen, 0.f);
+    // ── Remote player cat models ─────────────────────────────────────────────
+    if (g_skin_prog && g_cat_vbo && g_cat_tex) {
+        glUseProgram(g_skin_prog);
+        glUniform1i(g_skin_u_tex, 0);
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, g_avatar_tex);
+        glBindTexture(GL_TEXTURE_2D, g_cat_tex);
+        glUniform3fv(g_skin_u_tv_pos,   1, g_tv_screen_pos);
+        glUniform3fv(g_skin_u_lamp_pos, 1, g_lamp_pos);
+        glUniform1f (g_skin_u_lamp_intensity, g_lamp_intensity);
+
+        glDisable(GL_CULL_FACE);
+
+        glBindBuffer(GL_ARRAY_BUFFER, g_cat_vbo);
+        if(g_skin_a_pos>=0)    {glEnableVertexAttribArray(g_skin_a_pos);    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);}
+        if(g_skin_a_uv>=0)     {glEnableVertexAttribArray(g_skin_a_uv);     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);}
+        if(g_skin_a_norm>=0)   {glEnableVertexAttribArray(g_skin_a_norm);   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);}
+        if(g_skin_a_joints>=0) {glEnableVertexAttribArray(g_skin_a_joints); glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);}
+        if(g_skin_a_weights>=0){glEnableVertexAttribArray(g_skin_a_weights);glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);}
 
         for (int i=0; i<8; i++) {
             if (!g_remote[i].active) continue;
+
+            // Advance per-player animation, switching between idle (1) and walk (2)
+            int target = g_remote[i].moving ? 2 : 1;
+            if (g_remote[i].anim_idx != target) {
+                g_remote[i].anim_idx  = target;
+                g_remote[i].anim_time = 0.f;
+            }
+            if (!g_cat_anims.empty() && g_remote[i].anim_idx < (int)g_cat_anims.size()) {
+                float dur = g_cat_anims[g_remote[i].anim_idx].duration;
+                if (dur > 0.f) g_remote[i].anim_time = fmodf(g_remote[i].anim_time + 1.f/60.f, dur);
+            }
+            update_cat_anim(g_remote[i].anim_idx, g_remote[i].anim_time);
+
+            glUniformMatrix4fv(g_skin_u_vp,    1, GL_FALSE, vp);
+            glUniformMatrix4fv(g_skin_u_bones, CAT_JOINTS, GL_FALSE, &g_cat_bone_mats[0][0]);
+
             float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
+            float sc=0.2f;
             M4 world;
-            // Column-major Y-rotation + translation
-            world[0]=c;   world[1]=0.f; world[2]=-s;  world[3]=0.f;
-            world[4]=0.f; world[5]=1.f; world[6]=0.f; world[7]=0.f;
-            world[8]=s;   world[9]=0.f; world[10]=c;  world[11]=0.f;
-            world[12]=g_remote[i].x;
-            world[13]=g_remote[i].y - 13.f; // center box below eye level
-            world[14]=g_remote[i].z;
-            world[15]=1.f;
-            M4 mvp; m4_mul(mvp, vp, world);
-            glUniformMatrix4fv(g_u_mvp,   1, GL_FALSE, mvp);
-            glUniformMatrix4fv(g_u_model, 1, GL_FALSE, world);
-            glDrawArrays(GL_TRIANGLES, 0, g_avatar_vcount);
+            world[0]=c*sc; world[1]=0.f;  world[2]=-s*sc; world[3]=0.f;
+            world[4]=0.f;  world[5]=-sc;  world[6]=0.f;   world[7]=0.f;
+            world[8]=s*sc; world[9]=0.f;  world[10]=c*sc; world[11]=0.f;
+            world[12]=g_remote[i].x; world[13]=g_remote[i].y; world[14]=g_remote[i].z; world[15]=1.f;
+            glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
+            glDrawArrays(GL_TRIANGLES, 0, g_cat_vcount);
         }
+
+        if(g_skin_a_pos>=0)    glDisableVertexAttribArray(g_skin_a_pos);
+        if(g_skin_a_uv>=0)     glDisableVertexAttribArray(g_skin_a_uv);
+        if(g_skin_a_norm>=0)   glDisableVertexAttribArray(g_skin_a_norm);
+        if(g_skin_a_joints>=0) glDisableVertexAttribArray(g_skin_a_joints);
+        if(g_skin_a_weights>=0)glDisableVertexAttribArray(g_skin_a_weights);
+
+        glEnable(GL_CULL_FACE);
     }
 }
 
@@ -809,8 +1340,14 @@ extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
     std::vector<uint8_t> buf(sz);
     fread(buf.data(),1,sz,f); fclose(f);
     retro_game_info info={}; info.path=path; info.data=buf.data(); info.size=(size_t)sz;
-    if (retro_load_game(&info)) { g_running=true; printf("ROM loaded (%ld bytes)\n",sz); }
-    else printf("retro_load_game failed\n");
+    if (retro_load_game(&info)) {
+        g_running = true;
+        retro_system_av_info av = {};
+        retro_get_system_av_info(&av);
+        if (av.timing.sample_rate > 0)
+            g_audio_sample_rate = (unsigned)av.timing.sample_rate;
+        printf("ROM loaded (%ld bytes), audio %u Hz\n", sz, g_audio_sample_rate);
+    } else printf("retro_load_game failed\n");
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE int get_game_tex_id() {
@@ -821,6 +1358,44 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_frame_size(int w, int h) {
     g_frame_w = (unsigned)w;
     g_frame_h = (unsigned)h;
 }
+
+// ── Audio exports ────────────────────────────────────────────────────────────
+extern "C" EMSCRIPTEN_KEEPALIVE int16_t* get_audio_buf_ptr()    { return g_audio_buf; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_write_pos()  { return g_audio_write; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_buf_size()   { return AUDIO_BUF; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_sample_rate(){ return (int)g_audio_sample_rate; }
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_pos(float x, float y, float z) {
+    g_lamp_pos[0]=x; g_lamp_pos[1]=y; g_lamp_pos[2]=z;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_intensity(float v) {
+    g_lamp_intensity = v;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_overscan(float x, float y) {
+    g_overscan_x = x; g_overscan_y = y;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_room_xform(float scale, float rot_y_deg,
+                                                     float tx, float ty, float tz) {
+    g_room_scale = scale;
+    g_room_rot_y = rot_y_deg * 3.14159265f / 180.f;
+    g_room_tx = tx; g_room_ty = ty; g_room_tz = tz;
+}
+
+// TV world position (screen prim translation) — for 3D audio panner placement
+extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_x() {
+    for (const auto& p : g_prims) if (p.is_screen) return p.world[12];
+    return 0.f;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_y() {
+    for (const auto& p : g_prims) if (p.is_screen) return p.world[13];
+    return 0.f;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_z() {
+    for (const auto& p : g_prims) if (p.is_screen) return p.world[14];
+    return 0.f;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE float get_local_pitch() { return g_local.pitch; }
 
 // ── Multiplayer exports ──────────────────────────────────────────────────────
 extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_frame_ptr() {
@@ -834,10 +1409,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE float get_local_y()   { return g_local.y; }
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_z()   { return g_local.z; }
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_yaw() { return g_local.yaw; }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player(int id, float x, float y, float z, float yaw) {
+extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player(int id, float x, float y, float z, float yaw, int moving) {
     if (id < 0 || id >= 8) return;
     g_remote[id].x = x; g_remote[id].y = y; g_remote[id].z = z;
     g_remote[id].yaw = yaw; g_remote[id].active = true;
+    g_remote[id].moving = (moving != 0);
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_cat_eye_height(float v) { g_cat_eye_height = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE void set_local_y(float v) { g_local.y = v; }
+extern "C" EMSCRIPTEN_KEEPALIVE int get_local_moving() {
+    return (g_move[0] || g_move[1] || g_move[2] || g_move[3]) ? 1 : 0;
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
     if (id >= 0 && id < 8) g_remote[id].active = false;
@@ -856,7 +1437,7 @@ static void loop() {
 int main() {
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
-    attr.alpha=false; attr.depth=true; attr.majorVersion=1;
+    attr.alpha=false; attr.depth=true; attr.majorVersion=2;  // WebGL2: no NPOT restrictions
     auto ctx=emscripten_webgl_create_context("#canvas",&attr);
     emscripten_webgl_make_context_current(ctx);
 

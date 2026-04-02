@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_set_remote_player","_remove_remote_player"]'
+EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_audio_buf_ptr","_get_audio_write_pos","_get_audio_buf_size","_get_audio_sample_rate","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_get_local_moving","_set_cat_eye_height","_set_local_y"]'
 
 # ── 1. Get libretro.h ─────────────────────────────────────────────────────────
 if [ ! -f include/libretro.h ]; then
@@ -68,8 +68,8 @@ em++ -O2 -std=c++17 \
   frontend.cpp \
   "$COMMON_A" \
   "$GAMBATTE_A" \
-  -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
+  -s FULL_ES3=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
@@ -106,8 +106,8 @@ em++ -O2 -std=c++17 \
   frontend.cpp \
   "$COMMON_A" \
   "$SNES9X_A" \
-  -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
+  -s FULL_ES3=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
@@ -146,8 +146,8 @@ em++ -O2 -std=c++17 \
   "$COMMON_A" \
   "$PCSX_A" \
   -sUSE_ZLIB=1 \
-  -s FULL_ES2=1 \
-  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
+  -s FULL_ES3=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
   -s EXPORTED_FUNCTIONS="$EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=268435456 \

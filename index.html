@@ -67,6 +67,67 @@
     <input type="file" id="bios-input" accept=".bin" hidden>
   </label>
   &nbsp; <span id="status">No ROM loaded</span>
+  &nbsp;&nbsp;
+  <label style="font:11px monospace;color:#aaa">Overscan X
+    <input type="range" id="overscan-x" min="0" max="0.15" step="0.005" value="0.04"
+           style="width:80px;vertical-align:middle">
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Y
+    <input type="range" id="overscan-y" min="0" max="0.15" step="0.005" value="0.04"
+           style="width:80px;vertical-align:middle">
+  </label>
+</div>
+<div id="room-bar">
+  <span style="color:#888;font:11px monospace">Room:</span>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Scale
+    <input type="range" id="room-scale" min="1" max="60" step="0.5" value="32" style="width:80px;vertical-align:middle">
+    <span id="room-scale-val" style="color:#ccc">10</span>
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Rot Y°
+    <input type="number" id="room-roty" value="-180" step="5" style="width:50px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">X
+    <input type="number" id="room-tx" value="4" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Y
+    <input type="number" id="room-ty" value="21" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Z
+    <input type="number" id="room-tz" value="15" step="1" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+</div>
+<div id="lamp-bar">
+  <span style="color:#888;font:11px monospace">Lamp:</span>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">X
+    <input type="number" id="lamp-x" value="0" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Y
+    <input type="number" id="lamp-y" value="-45" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  <label style="font:11px monospace;color:#aaa">Z
+    <input type="number" id="lamp-z" value="-260" step="5" style="width:55px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Intensity
+    <input type="range" id="lamp-intensity" min="0" max="12" step="0.1" value="1" style="width:80px;vertical-align:middle">
+    <span id="lamp-intensity-val" style="color:#ccc">1</span>
+  </label>
+</div>
+<div id="player-bar">
+  <span style="color:#888;font:11px monospace">Me:</span>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Feet Y
+    <input type="number" id="my-y" value="20" step="1" style="width:60px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
+  &nbsp;
+  <label style="font:11px monospace;color:#aaa">Eye height
+    <input type="number" id="cat-eye-height" value="-35" step="1" style="width:60px;background:#222;border:1px solid #444;color:#ddd;padding:2px 4px;border-radius:4px;font:11px monospace">
+  </label>
 </div>
 <div id="mp-bar">
   <button onclick="mpHost()">Host</button>
@@ -95,6 +156,113 @@ const overlay = document.getElementById('overlay');
   Object.defineProperty(canvas, 'width',  { get: () => w, set: () => {} });
   Object.defineProperty(canvas, 'height', { get: () => h, set: () => {} });
 })();
+
+// ── Audio state ───────────────────────────────────────────────
+let audioCtx    = null;
+let audioNode   = null;
+let audioPanner = null;
+let audioReadPos = 0;
+let audioBufBase = 0;
+let audioBufSize = 0;
+
+function startAudio() {
+  if (!coreModule) return;
+  const rate = coreModule._get_audio_sample_rate();
+  // Close previous context if sample rate changed (different core)
+  if (audioCtx && audioCtx.sampleRate !== rate) {
+    audioCtx.close();
+    audioCtx = null;
+    audioNode = null;
+    audioPanner = null;
+  }
+  if (!audioCtx) {
+    try {
+      audioCtx = new AudioContext({ sampleRate: rate });
+    } catch(e) {
+      audioCtx = new AudioContext(); // fallback: browser default rate
+    }
+  }
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // Reset read position to current write position so we don't replay old samples
+  audioBufBase = coreModule._get_audio_buf_ptr() >> 1; // HEAP16 index
+  audioBufSize = coreModule._get_audio_buf_size();
+  audioReadPos = coreModule._get_audio_write_pos();
+
+  if (audioNode) return; // already created for this context
+
+  // ── PannerNode: audio source fixed at the TV's world position ──
+  audioPanner = audioCtx.createPanner();
+  audioPanner.panningModel  = 'HRTF';      // binaural head-related transfer
+  audioPanner.distanceModel = 'inverse';
+  audioPanner.refDistance   = 80;          // full volume at ~player start distance
+  audioPanner.maxDistance   = 2000;
+  audioPanner.rolloffFactor = 4;
+
+  // TV doesn't move — set its position once
+  const tvx = coreModule._get_tv_x();
+  const tvy = coreModule._get_tv_y();
+  const tvz = coreModule._get_tv_z();
+  if (audioPanner.positionX !== undefined) {
+    audioPanner.positionX.value = tvx;
+    audioPanner.positionY.value = tvy;
+    audioPanner.positionZ.value = tvz;
+  } else {
+    audioPanner.setPosition(tvx, tvy, tvz);
+  }
+
+  // 4096-sample ScriptProcessor, no inputs, 2 stereo output channels
+  audioNode = audioCtx.createScriptProcessor(4096, 0, 2);
+  audioNode.onaudioprocess = function(ev) {
+    if (!coreModule || !audioBufSize) return;
+    const wp  = coreModule._get_audio_write_pos();
+    const h16 = coreModule.HEAP16;
+    const L   = ev.outputBuffer.getChannelData(0);
+    const R   = ev.outputBuffer.getChannelData(1);
+    for (let i = 0; i < L.length; i++) {
+      const avail = (wp - audioReadPos + audioBufSize) % audioBufSize;
+      if (avail < 2) { L[i] = R[i] = 0; continue; }
+      L[i] = h16[audioBufBase + audioReadPos] / 32768.0;
+      audioReadPos = (audioReadPos + 1) % audioBufSize;
+      R[i] = h16[audioBufBase + audioReadPos] / 32768.0;
+      audioReadPos = (audioReadPos + 1) % audioBufSize;
+    }
+  };
+
+  // Chain: ScriptProcessor → PannerNode → speakers
+  audioNode.connect(audioPanner);
+  audioPanner.connect(audioCtx.destination);
+
+  // Per-frame listener (player ears) update
+  (function updateListener() {
+    if (audioCtx && coreModule) {
+      const lx  = coreModule._get_local_x();
+      const ly  = coreModule._get_local_y();
+      const lz  = coreModule._get_local_z();
+      const yaw = coreModule._get_local_yaw();
+      const pit = coreModule._get_local_pitch();
+      // Forward vector from yaw + pitch
+      const cosPit = Math.cos(pit);
+      const fx = cosPit * Math.sin(yaw);
+      const fy = Math.sin(pit);
+      const fz = cosPit * Math.cos(yaw);
+      // Up vector (perpendicular to forward, always world-up biased)
+      const listener = audioCtx.listener;
+      if (listener.positionX !== undefined) {
+        listener.positionX.value = lx;
+        listener.positionY.value = ly;
+        listener.positionZ.value = lz;
+        listener.forwardX.value  = fx;
+        listener.forwardY.value  = fy;
+        listener.forwardZ.value  = fz;
+        listener.upX.value = 0; listener.upY.value = 1; listener.upZ.value = 0;
+      } else {
+        listener.setPosition(lx, ly, lz);
+        listener.setOrientation(fx, fy, fz, 0, 1, 0);
+      }
+    }
+    requestAnimationFrame(updateListener);
+  })();
+}
 
 // ── Multiplayer state ─────────────────────────────────────────
 let frontendGL  = null;   // Emscripten GL table (captured after core loads)
@@ -171,10 +339,11 @@ function startPositionSync(conn) {
   setInterval(function() {
     if (!conn.open || !coreModule) return;
     conn.send({ type: 'pos',
-      x:   coreModule.ccall('get_local_x',   'number', [], []),
-      y:   coreModule.ccall('get_local_y',   'number', [], []),
-      z:   coreModule.ccall('get_local_z',   'number', [], []),
-      yaw: coreModule.ccall('get_local_yaw', 'number', [], [])
+      x:      coreModule.ccall('get_local_x',      'number', [], []),
+      y:      coreModule.ccall('get_local_y',      'number', [], []),
+      z:      coreModule.ccall('get_local_z',      'number', [], []),
+      yaw:    coreModule.ccall('get_local_yaw',    'number', [], []),
+      moving: coreModule.ccall('get_local_moving', 'number', [], [])
     });
   }, 50); // 20 Hz
 }
@@ -197,8 +366,8 @@ function mpHost() {
     conn.on('data', function(data) {
       if (data.type === 'pos' && coreModule)
         coreModule.ccall('set_remote_player', 'void',
-          ['number','number','number','number','number'],
-          [remoteId, data.x, data.y, data.z, data.yaw]);
+          ['number','number','number','number','number','number'],
+          [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
     });
     conn.on('close', function() {
       if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[remoteId]);
@@ -232,8 +401,8 @@ function mpJoin() {
       conn.on('data', function(data) {
         if (data.type === 'pos' && coreModule)
           coreModule.ccall('set_remote_player', 'void',
-            ['number','number','number','number','number'],
-            [0, data.x, data.y, data.z, data.yaw]);
+            ['number','number','number','number','number','number'],
+            [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
       });
       conn.on('close', function() {
         if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[0]);
@@ -321,7 +490,7 @@ function loadCore(bundle, callback) {
     loadedCore = bundle;
     if (!frontendGL) {
       frontendGL  = window.GL;
-      frontendCtx = document.getElementById('canvas').getContext('webgl');
+      frontendCtx = document.getElementById('canvas').getContext('webgl2');
     }
     callback();
   });
@@ -380,7 +549,7 @@ function loadN64(file) {
     // Save game_gbc's GL table NOW before n64wasm can overwrite window.GL
     // Use local names that don't shadow the module-level vars, then set both.
     var n64GL  = window.GL;
-    var n64Ctx = document.getElementById('canvas').getContext('webgl');
+    var n64Ctx = document.getElementById('canvas').getContext('webgl2');
     if (!frontendGL) { frontendGL = n64GL; frontendCtx = n64Ctx; }
     var texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
     // Tell the CRT shader that the game texture is N64-sized, not GBC-sized
@@ -521,6 +690,59 @@ document.addEventListener('keyup', e => {
 });
 
 // ── PS1 BIOS loading ──────────────────────────────────────────
+function applyRoomXform() {
+  if (!coreModule || !coreModule._set_room_xform) return;
+  const scale = parseFloat(document.getElementById('room-scale').value);
+  const rotY  = parseFloat(document.getElementById('room-roty').value) || 0;
+  const tx    = parseFloat(document.getElementById('room-tx').value)   || 0;
+  const ty    = parseFloat(document.getElementById('room-ty').value)   || 0;
+  const tz    = parseFloat(document.getElementById('room-tz').value)   || 0;
+  document.getElementById('room-scale-val').textContent = scale;
+  coreModule.ccall('set_room_xform', null, ['number','number','number','number','number'],
+                   [scale, rotY, tx, ty, tz]);
+}
+['room-scale','room-roty','room-tx','room-ty','room-tz'].forEach(function(id) {
+  document.getElementById(id).addEventListener('input', applyRoomXform);
+});
+
+function applyOverscan() {
+  if (!coreModule || !coreModule._set_overscan) return;
+  const x = parseFloat(document.getElementById('overscan-x').value);
+  const y = parseFloat(document.getElementById('overscan-y').value);
+  coreModule.ccall('set_overscan', null, ['number', 'number'], [x, y]);
+}
+document.getElementById('overscan-x').addEventListener('input', applyOverscan);
+document.getElementById('overscan-y').addEventListener('input', applyOverscan);
+
+function applyLampPos() {
+  if (!coreModule) return;
+  const x = parseFloat(document.getElementById('lamp-x').value) || 0;
+  const y = parseFloat(document.getElementById('lamp-y').value) || 0;
+  const z = parseFloat(document.getElementById('lamp-z').value) || 0;
+  coreModule.ccall('set_lamp_pos', null, ['number','number','number'], [x, y, z]);
+}
+['lamp-x','lamp-y','lamp-z'].forEach(function(id) {
+  document.getElementById(id).addEventListener('input', applyLampPos);
+});
+
+function applyLampIntensity() {
+  if (!coreModule) return;
+  const v = parseFloat(document.getElementById('lamp-intensity').value);
+  document.getElementById('lamp-intensity-val').textContent = v;
+  coreModule.ccall('set_lamp_intensity', null, ['number'], [v]);
+}
+document.getElementById('lamp-intensity').addEventListener('input', applyLampIntensity);
+
+document.getElementById('my-y').addEventListener('input', function() {
+  if (!coreModule) return;
+  coreModule.ccall('set_local_y', null, ['number'], [parseFloat(this.value)]);
+});
+
+document.getElementById('cat-eye-height').addEventListener('input', function() {
+  if (!coreModule) return;
+  coreModule.ccall('set_cat_eye_height', null, ['number'], [parseFloat(this.value)]);
+});
+
 document.getElementById('bios-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
   if (!file) return;
@@ -571,6 +793,7 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
         coreModule.FS.writeFile(romPath, new Uint8Array(ev.target.result));
         // For .cue discs the entry point is the .cue file itself
         coreModule.ccall('start_game', 'void', ['string'], [romPath]);
+        startAudio();
         setStatus('Playing: ' + file.name);
       };
       reader.readAsArrayBuffer(file);
@@ -584,6 +807,7 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
     reader.onload = ev => {
       coreModule.FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
       coreModule.ccall('start_game', 'void', ['string'], ['/rom.bin']);
+      startAudio();
       setStatus('Playing: ' + file.name);
     };
     reader.readAsArrayBuffer(file);
