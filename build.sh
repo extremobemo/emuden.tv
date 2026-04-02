@@ -154,7 +154,47 @@ em++ -O2 -std=c++17 \
   --preload-file tv/ \
   -o game_ps1.js
 
-# ── 9. Download N64Wasm prebuilt files ────────────────────────────────────────
+# ── 9. Build mGBA core ────────────────────────────────────────────────────────
+MGBA_A=cores/mgba/mgba_libretro.a
+
+if [ ! -f "$MGBA_A" ]; then
+  mkdir -p cores
+  [ ! -d cores/mgba ] && \
+    git clone --depth 1 https://github.com/libretro/mgba cores/mgba
+
+  cd cores/mgba
+  emmake make -f Makefile.libretro platform=emscripten CC=emcc CXX=em++ AR=emar RANLIB=emranlib
+  if [ -f mgba_libretro_emscripten.bc ]; then
+    cp mgba_libretro_emscripten.bc "$SCRIPT_DIR/$MGBA_A"
+  elif [ -f mgba_libretro.bc ]; then
+    cp mgba_libretro.bc "$SCRIPT_DIR/$MGBA_A"
+  elif [ -f mgba_libretro.a ]; then
+    cp mgba_libretro.a "$SCRIPT_DIR/$MGBA_A"
+  fi
+  cd "$SCRIPT_DIR"
+fi
+
+[ ! -f "$MGBA_A" ] && { echo "mGBA build failed: archive not found"; exit 1; }
+echo "mGBA: $MGBA_A"
+
+# ── 10. Link GBA bundle ───────────────────────────────────────────────────────
+echo "Linking game_gba.js..."
+em++ -O2 -std=c++17 \
+  -I include \
+  -I "$LIBRETRO_COMMON/include" \
+  frontend.cpp \
+  "$COMMON_A" \
+  "$MGBA_A" \
+  -sUSE_ZLIB=1 \
+  -s FULL_ES3=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
+  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s INITIAL_MEMORY=134217728 \
+  --preload-file tv/ \
+  -o game_gba.js
+
+# ── 11. Download N64Wasm prebuilt files ───────────────────────────────────────
 if [ ! -f n64wasm.js ]; then
   echo "Downloading N64Wasm prebuilt..."
   curl -Lo n64wasm.js \

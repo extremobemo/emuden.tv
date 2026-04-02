@@ -60,7 +60,7 @@
 </div>
 <div id="ui">
   <label>Load ROM
-    <input type="file" id="rom-input" accept=".gb,.gbc,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64,.chd,.cue,.bin,.img" hidden multiple>
+    <input type="file" id="rom-input" accept=".gb,.gbc,.gba,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64,.chd,.cue,.bin,.img" hidden multiple>
   </label>
   &nbsp;
   <label>PS1 BIOS
@@ -477,6 +477,7 @@ function mpJoin() {
 const CORE_MAP = {
   'gb':  'game_gbc.js',
   'gbc': 'game_gbc.js',
+  'gba': 'game_gba.js',
   'sfc': 'game_snes.js',
   'smc': 'game_snes.js',
   'fig': 'game_snes.js',
