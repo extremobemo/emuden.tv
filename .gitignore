@@ -1,17 +1,10 @@
 # Build outputs
-game.js
-game_gbc.js
-game_snes.js
-game_ps1.js
-game_gbc.data
-game_snes.data
-game_ps1.data
-game_dc.js
+game*.js
+game*.wasm
+game*.data
 n64wasm.js
 n64wasm.wasm
 assets.zip
-game.wasm
-game.data
 
 # Emscripten generated
 *.mem
