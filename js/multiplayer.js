@@ -7,9 +7,16 @@ import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
 import { getGameAudioTrack, startViewerAudio, setAudioSourcePos, setAudioPannerSettings } from './audio.js';
 
-let peerInst = null;
-let mpConns  = [];
+let peerInst  = null;
+let mpConns   = [];
 let gameStream = null;
+let hostConn  = null;   // guest-side: connection back to the host
+
+// Send a button event to the host (called by input.js when this guest has control)
+export function mpSendButton(id, pressed) {
+  if (hostConn && hostConn.open)
+    hostConn.send({ type: 'btn', id, pressed });
+}
 
 // ── Scene state ──────────────────────────────────────────────
 function getSceneState() {
@@ -87,6 +94,28 @@ export function broadcastScene() {
 function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
 }
+
+function ctrlSend(connIdx, isController) {
+  const c = mpConns[connIdx];
+  if (c && c.open) c.send({ type: 'ctrl', isController });
+}
+
+function ctrlSetHost() {
+  if (state.controller !== 'host') {
+    ctrlSend(state.controller, false);
+  }
+  state.controller = 'host';
+  const sel = document.getElementById('controller-select');
+  if (sel) sel.value = 'host';
+}
+
+document.getElementById('controller-select').addEventListener('change', function() {
+  const prev = state.controller;
+  const next = this.value === 'host' ? 'host' : parseInt(this.value);
+  if (prev !== 'host') ctrlSend(prev, false);
+  state.controller = next;
+  if (next !== 'host') ctrlSend(next, true);
+});
 
 // Broadcast local player position + model to all connected peers at 60 Hz
 function startPositionSync(conn) {
@@ -173,7 +202,9 @@ function setupVideoReceive(stream) {
 
 export function mpHost() {
   state.mpIsHost = true;
+  state.controller = 'host';
   startFrameCapture();
+  document.getElementById('controller-wrap').style.display = '';
   peerInst = new window.Peer();
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
   peerInst.on('open', function(id) {
@@ -186,6 +217,14 @@ export function mpHost() {
       conn.send(getSceneState());
       mpSetStatus('Guest connected');
       startPositionSync(conn);
+      // Add this guest to the controller select
+      const sel = document.getElementById('controller-select');
+      if (sel) {
+        const opt = document.createElement('option');
+        opt.value = remoteId;
+        opt.textContent = 'Guest ' + (remoteId + 1);
+        sel.appendChild(opt);
+      }
     });
     conn.on('data', function(data) {
       if (data.type === 'pos' && state.rendererModule) {
@@ -196,11 +235,21 @@ export function mpHost() {
           ['number','number'], [remoteId, data.model || 0]);
       } else if (data.type === 'scene') {
         applySceneState(data);
+      } else if (data.type === 'btn' && state.controller === remoteId && state.coreWorker) {
+        state.coreWorker.postMessage({ type: 'button', id: data.id, pressed: data.pressed });
       }
     });
     conn.on('close', function() {
+      // If this guest had control, reset to host
+      if (state.controller === remoteId) ctrlSetHost();
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [remoteId]);
+      // Remove their option from the controller select
+      const sel = document.getElementById('controller-select');
+      if (sel) {
+        const opt = sel.querySelector('option[value="' + remoteId + '"]');
+        if (opt) opt.remove();
+      }
       mpConns.splice(mpConns.indexOf(conn), 1);
       mpSetStatus('Guest disconnected');
     });
@@ -225,13 +274,14 @@ export function mpJoin() {
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
   peerInst.on('open', function() {
     // Data channel for position sync
-    const conn = peerInst.connect(hostId, { reliable: false });
-    conn.on('open', function() {
+    hostConn = peerInst.connect(hostId, { reliable: false });
+    hostConn.on('open', function() {
+      state.mpConnected = true;
       document.querySelector('.scene-section').style.display = 'none';
       mpSetStatus('In room with ' + hostId);
-      startPositionSync(conn);
+      startPositionSync(hostConn);
     });
-    conn.on('data', function(data) {
+    hostConn.on('data', function(data) {
       if (data.type === 'pos' && state.rendererModule) {
         state.rendererModule.ccall('set_remote_player', 'void',
           ['number','number','number','number','number','number'],
@@ -240,9 +290,13 @@ export function mpJoin() {
           ['number','number'], [0, data.model || 0]);
       } else if (data.type === 'scene') {
         applySceneState(data);
+      } else if (data.type === 'ctrl') {
+        state.isController = !!data.isController;
       }
     });
-    conn.on('close', function() {
+    hostConn.on('close', function() {
+      state.mpConnected = false;
+      state.isController = false;
       document.querySelector('.scene-section').style.display = '';
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [0]);

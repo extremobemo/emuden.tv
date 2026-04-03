@@ -3,6 +3,7 @@
 // Arrow keys / game buttons → libretro core Worker (via postMessage)
 
 import { state } from './state.js';
+import { mpSendButton } from './multiplayer.js';
 
 const MOVE_MAP = { 'KeyW': 0, 'KeyS': 1, 'KeyA': 2, 'KeyD': 3 };
 
@@ -47,8 +48,15 @@ export function initInput() {
     }
     if (GAME_MAP[e.code] !== undefined) {
       e.preventDefault();
-      if (state.coreWorker)
-        state.coreWorker.postMessage({ type: 'button', id: GAME_MAP[e.code], pressed: true });
+      const id = GAME_MAP[e.code];
+      if (state.mpIsHost) {
+        if (state.controller === 'host' && state.coreWorker)
+          state.coreWorker.postMessage({ type: 'button', id, pressed: true });
+      } else if (state.mpConnected) {
+        if (state.isController) mpSendButton(id, true);
+      } else if (state.coreWorker) {
+        state.coreWorker.postMessage({ type: 'button', id, pressed: true });
+      }
     }
   });
 
@@ -56,7 +64,16 @@ export function initInput() {
     if (MOVE_MAP[e.code] !== undefined && state.rendererModule)
       state.rendererModule.ccall('set_move_key', 'void',
         ['number','number'], [MOVE_MAP[e.code], 0]);
-    if (GAME_MAP[e.code] !== undefined && state.coreWorker)
-      state.coreWorker.postMessage({ type: 'button', id: GAME_MAP[e.code], pressed: false });
+    if (GAME_MAP[e.code] !== undefined) {
+      const id = GAME_MAP[e.code];
+      if (state.mpIsHost) {
+        if (state.controller === 'host' && state.coreWorker)
+          state.coreWorker.postMessage({ type: 'button', id, pressed: false });
+      } else if (state.mpConnected) {
+        if (state.isController) mpSendButton(id, false);
+      } else if (state.coreWorker) {
+        state.coreWorker.postMessage({ type: 'button', id, pressed: false });
+      }
+    }
   });
 }
