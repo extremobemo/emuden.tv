@@ -5,7 +5,7 @@ import { state } from './state.js';
 import { setStatus } from './utils.js';
 import { spawnCoreWorker, setBiosFile, setGbaSave, ps1BiosLoaded, PS1_EXTS } from './worker-bridge.js';
 import { loadN64 } from './n64.js';
-import { mpHost, mpJoin } from './multiplayer.js';
+import { mpHost, mpJoin, broadcastScene } from './multiplayer.js';
 import { initInput } from './input.js';
 
 // ── Canvas sizing ─────────────────────────────────────────────
@@ -242,6 +242,10 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
 // ── Multiplayer button wiring ─────────────────────────────────
 document.getElementById('btn-host').addEventListener('click', mpHost);
 document.getElementById('btn-join').addEventListener('click', mpJoin);
+
+// ── Scene broadcast ───────────────────────────────────────────
+// Any change to a scene control is forwarded to connected guests.
+document.querySelector('.scene-section').addEventListener('input', broadcastScene);
 
 // ── Input setup ───────────────────────────────────────────────
 initInput();

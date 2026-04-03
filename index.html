@@ -76,6 +76,14 @@
   #settings-panel .core-icon { font-size: 13px; width: 20px; flex-shrink: 0; }
   #settings-panel .core-label { color: #999; font: 11px monospace; }
   #settings-panel .core-note { color: #555; font: 10px monospace; margin-left: 2px; }
+  #settings-panel .s-sub {
+    color: #444; font: 10px monospace; text-transform: uppercase;
+    letter-spacing: 0.1em; margin: 10px 0 5px;
+  }
+  #settings-panel .s-title.collapsible { cursor: pointer; user-select: none; }
+  #settings-panel .s-title.collapsible::after { content: ' ▾'; color: #444; font-style: normal; }
+  #settings-panel .s-title.collapsible.closed::after { content: ' ▸'; }
+  #settings-panel .scene-section.collapsed > :not(.s-title) { display: none !important; }
 </style>
 </head>
 <body>
@@ -154,17 +162,19 @@
       <span class="core-label">N64</span>
     </div>
   </div>
-  <div class="s-section">
-    <div class="s-title">Overscan</div>
+
+  <div class="s-section scene-section">
+    <div class="s-title collapsible" onclick="this.classList.toggle('closed'); this.closest('.scene-section').classList.toggle('collapsed')">Scene</div>
+
+    <div class="s-sub">Overscan</div>
     <div class="s-row">
       <label>X <input type="range" id="overscan-x" min="-0.3" max="0.4" step="0.005" value="0.04"></label>
     </div>
     <div class="s-row">
       <label>Y <input type="range" id="overscan-y" min="-0.3" max="0.4" step="0.005" value="0.04"></label>
     </div>
-  </div>
-  <div class="s-section">
-    <div class="s-title">Room</div>
+
+    <div class="s-sub">Room</div>
     <div class="s-row">
       <label>Scale
         <input type="range" id="room-scale" min="1" max="60" step="0.5" value="32">
@@ -179,9 +189,8 @@
       <label>Y <input type="number" id="room-ty" value="21" step="1"></label>
       <label>Z <input type="number" id="room-tz" value="15" step="1"></label>
     </div>
-  </div>
-  <div class="s-section">
-    <div class="s-title">Lamp</div>
+
+    <div class="s-sub">Lamp</div>
     <div class="s-row">
       <label>X <input type="number" id="lamp-x" value="0" step="5"></label>
       <label>Y <input type="number" id="lamp-y" value="-45" step="5"></label>
@@ -193,9 +202,8 @@
         <span id="lamp-intensity-val" class="val">1</span>
       </label>
     </div>
-  </div>
-  <div class="s-section">
-    <div class="s-title">TV</div>
+
+    <div class="s-sub">TV</div>
     <div class="s-row">
       <label>Emission
         <input type="range" id="tv-intensity" min="0" max="8" step="0.1" value="1.7">
@@ -209,7 +217,43 @@
       <label>Pitch° <input type="number" id="cone-pitch" value="-362" step="1"></label>
       <label>Power <input type="number" id="cone-power" value="18.2" step="0.1"></label>
     </div>
+
+    <div class="s-sub">Audio Source</div>
+    <div class="s-row">
+      <label>X <input type="number" id="audio-src-x" value="0" step="1"></label>
+      <label>Y <input type="number" id="audio-src-y" value="0" step="1"></label>
+      <label>Z <input type="number" id="audio-src-z" value="0" step="1"></label>
+      <label style="cursor:pointer"><input type="checkbox" id="audio-debug-cube"> Show</label>
+    </div>
+    <div class="s-row">
+      <label>Model
+        <select id="audio-model">
+          <option value="inverse" selected>Inverse</option>
+          <option value="linear">Linear</option>
+          <option value="exponential">Exponential</option>
+        </select>
+      </label>
+    </div>
+    <div class="s-row">
+      <label>Ref Dist
+        <input type="range" id="audio-ref-dist" min="1" max="400" step="1" value="100">
+        <span id="audio-ref-dist-val" class="val">100</span>
+      </label>
+    </div>
+    <div class="s-row">
+      <label>Max Dist
+        <input type="range" id="audio-max-dist" min="10" max="600" step="5" value="10">
+        <span id="audio-max-dist-val" class="val">10</span>
+      </label>
+    </div>
+    <div class="s-row">
+      <label>Rolloff
+        <input type="range" id="audio-rolloff" min="0" max="50" step="0.5" value="2">
+        <span id="audio-rolloff-val" class="val">2</span>
+      </label>
+    </div>
   </div>
+
   <div class="s-section">
     <div class="s-title">Player</div>
     <div class="s-row">

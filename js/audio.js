@@ -8,9 +8,35 @@ const audioRing   = new Float32Array(AUDIO_RING);
 let audioRingWrite = 0;
 let audioRingRead  = 0;
 
-let audioCtx    = null;
-let audioNode   = null;
-let audioPanner = null;
+let audioCtx        = null;
+let audioNode       = null;
+let audioPanner     = null;
+let viewerPanner    = null;
+let mediaStreamDest = null;
+
+// Shared panner config — updated live by the settings sliders
+const _cfg = {
+  x: 0, y: 0, z: 0,
+  refDistance:   100,
+  maxDistance:   10,
+  rolloffFactor: 2,
+  distanceModel: 'inverse',
+};
+
+function _applyPannerCfg(p) {
+  if (!p) return;
+  p.distanceModel = _cfg.distanceModel;
+  p.refDistance   = _cfg.refDistance;
+  p.maxDistance   = _cfg.maxDistance;
+  p.rolloffFactor = _cfg.rolloffFactor;
+  if (p.positionX !== undefined) {
+    p.positionX.value = _cfg.x;
+    p.positionY.value = _cfg.y;
+    p.positionZ.value = _cfg.z;
+  } else {
+    p.setPosition(_cfg.x, _cfg.y, _cfg.z);
+  }
+}
 
 // Feed Int16 stereo samples (from worker) into the JS ring buffer.
 export function receiveAudio(buf) {
@@ -27,7 +53,7 @@ export function startAudio(sampleRate) {
   // Close previous context if sample rate changed (different core)
   if (audioCtx && audioCtx.sampleRate !== sampleRate) {
     audioCtx.close();
-    audioCtx = null; audioNode = null; audioPanner = null;
+    audioCtx = null; audioNode = null; audioPanner = null; mediaStreamDest = null;
   }
   if (!audioCtx) {
     try { audioCtx = new AudioContext({ sampleRate }); }
@@ -39,26 +65,21 @@ export function startAudio(sampleRate) {
 
   if (audioNode) return; // ScriptProcessor already wired for this context
 
-  // PannerNode: audio source fixed at the TV's world position
-  audioPanner = audioCtx.createPanner();
-  audioPanner.panningModel  = 'HRTF';
-  audioPanner.distanceModel = 'inverse';
-  audioPanner.refDistance   = 80;
-  audioPanner.maxDistance   = 2000;
-  audioPanner.rolloffFactor = 4;
-
-  if (state.rendererModule) {
-    const tvx = state.rendererModule._get_tv_x();
-    const tvy = state.rendererModule._get_tv_y();
-    const tvz = state.rendererModule._get_tv_z();
-    if (audioPanner.positionX !== undefined) {
-      audioPanner.positionX.value = tvx;
-      audioPanner.positionY.value = tvy;
-      audioPanner.positionZ.value = tvz;
-    } else {
-      audioPanner.setPosition(tvx, tvy, tvz);
-    }
+  // Seed source position from TV world coords on first init (sliders start at 0,0,0)
+  if (_cfg.x === 0 && _cfg.y === 0 && _cfg.z === 0 && state.rendererModule) {
+    const tvx = Math.round(state.rendererModule._get_tv_x());
+    const tvy = Math.round(state.rendererModule._get_tv_y());
+    const tvz = Math.round(state.rendererModule._get_tv_z());
+    document.getElementById('audio-src-x').value = tvx;
+    document.getElementById('audio-src-y').value = tvy;
+    document.getElementById('audio-src-z').value = tvz;
+    _setPos(tvx, tvy, tvz);
   }
+
+  // PannerNode: audio source at the position set by the audio sliders
+  audioPanner = audioCtx.createPanner();
+  audioPanner.panningModel = 'HRTF';
+  _applyPannerCfg(audioPanner);
 
   // 4096-sample ScriptProcessor, no inputs, 2 stereo output channels
   audioNode = audioCtx.createScriptProcessor(4096, 0, 2);
@@ -67,8 +88,8 @@ export function startAudio(sampleRate) {
     const R = ev.outputBuffer.getChannelData(1);
     for (let i = 0; i < L.length; i++) {
       if (audioRingWrite - audioRingRead >= 2) {
-        L[i] = audioRing[audioRingRead % AUDIO_RING]; audioRingRead++;
         R[i] = audioRing[audioRingRead % AUDIO_RING]; audioRingRead++;
+        L[i] = audioRing[audioRingRead % AUDIO_RING]; audioRingRead++;
       } else {
         L[i] = R[i] = 0;
       }
@@ -78,6 +99,10 @@ export function startAudio(sampleRate) {
   // Chain: ScriptProcessor → PannerNode → speakers
   audioNode.connect(audioPanner);
   audioPanner.connect(audioCtx.destination);
+
+  // Also tap raw stereo off the ScriptProcessor for WebRTC streaming to guests
+  mediaStreamDest = audioCtx.createMediaStreamDestination();
+  audioNode.connect(mediaStreamDest);
 
   // Per-frame: update Web Audio listener to match the player's position and look direction
   (function updateListener() {
@@ -108,3 +133,122 @@ export function startAudio(sampleRate) {
     requestAnimationFrame(updateListener);
   })();
 }
+
+// Returns the audio track from the ScriptProcessor output for inclusion in a WebRTC stream.
+export function getGameAudioTrack() {
+  if (!mediaStreamDest) return null;
+  const tracks = mediaStreamDest.stream.getAudioTracks();
+  return tracks.length ? tracks[0] : null;
+}
+
+// Guest-side: receive an audio track from the host and play it with spatial sound.
+export function startViewerAudio(audioTrack) {
+  let ctx;
+  try { ctx = new AudioContext(); }
+  catch(e) { console.warn('viewer audio:', e); return; }
+  if (ctx.state === 'suspended') ctx.resume();
+
+  const source = ctx.createMediaStreamSource(new MediaStream([audioTrack]));
+  viewerPanner = ctx.createPanner();
+  viewerPanner.panningModel = 'HRTF';
+  _applyPannerCfg(viewerPanner);
+
+  source.connect(viewerPanner);
+  viewerPanner.connect(ctx.destination);
+
+  (function updateViewerListener() {
+    if (ctx && state.rendererModule) {
+      const lx  = state.rendererModule._get_local_x();
+      const ly  = state.rendererModule._get_local_y();
+      const lz  = state.rendererModule._get_local_z();
+      const yaw = state.rendererModule._get_local_yaw();
+      const pit = state.rendererModule._get_local_pitch();
+      const cosPit = Math.cos(pit);
+      const fx = cosPit * Math.sin(yaw);
+      const fy = Math.sin(pit);
+      const fz = cosPit * Math.cos(yaw);
+      const listener = ctx.listener;
+      if (listener.positionX !== undefined) {
+        listener.positionX.value = lx;
+        listener.positionY.value = ly;
+        listener.positionZ.value = lz;
+        listener.forwardX.value  = fx;
+        listener.forwardY.value  = fy;
+        listener.forwardZ.value  = fz;
+        listener.upX.value = 0; listener.upY.value = 1; listener.upZ.value = 0;
+      } else {
+        listener.setPosition(lx, ly, lz);
+        listener.setOrientation(fx, fy, fz, 0, 1, 0);
+      }
+    }
+    requestAnimationFrame(updateViewerListener);
+  })();
+}
+
+// ── Settings slider wiring ────────────────────────────────────
+
+function _setPos(x, y, z) {
+  _cfg.x = x; _cfg.y = y; _cfg.z = z;
+  [audioPanner, viewerPanner].forEach(function(p) {
+    if (!p) return;
+    if (p.positionX !== undefined) {
+      p.positionX.value = x; p.positionY.value = y; p.positionZ.value = z;
+    } else {
+      p.setPosition(x, y, z);
+    }
+  });
+  if (state.rendererModule && state.rendererModule._set_debug_cube_pos)
+    state.rendererModule.ccall('set_debug_cube_pos', null, ['number','number','number'], [x, y, z]);
+}
+
+function _applyAudioSource() {
+  _setPos(
+    parseFloat(document.getElementById('audio-src-x').value) || 0,
+    parseFloat(document.getElementById('audio-src-y').value) || 0,
+    parseFloat(document.getElementById('audio-src-z').value) || 0
+  );
+}
+
+function _applyAudioPanner() {
+  const refDist = parseFloat(document.getElementById('audio-ref-dist').value);
+  const maxDist = parseFloat(document.getElementById('audio-max-dist').value);
+  const rolloff = parseFloat(document.getElementById('audio-rolloff').value);
+  const model   = document.getElementById('audio-model').value;
+  document.getElementById('audio-ref-dist-val').textContent = refDist;
+  document.getElementById('audio-max-dist-val').textContent = maxDist;
+  document.getElementById('audio-rolloff-val').textContent  = rolloff;
+  _cfg.refDistance = refDist; _cfg.maxDistance = maxDist;
+  _cfg.rolloffFactor = rolloff; _cfg.distanceModel = model;
+  [audioPanner, viewerPanner].forEach(function(p) {
+    if (!p) return;
+    p.refDistance = refDist; p.maxDistance = maxDist;
+    p.rolloffFactor = rolloff; p.distanceModel = model;
+  });
+}
+
+export function setAudioSourcePos(x, y, z) {
+  _setPos(x, y, z);
+}
+
+export function setAudioPannerSettings(refDist, maxDist, rolloff, model) {
+  _cfg.refDistance = refDist; _cfg.maxDistance = maxDist;
+  _cfg.rolloffFactor = rolloff; _cfg.distanceModel = model;
+  [audioPanner, viewerPanner].forEach(function(p) {
+    if (!p) return;
+    p.refDistance = refDist; p.maxDistance = maxDist;
+    p.rolloffFactor = rolloff; p.distanceModel = model;
+  });
+}
+
+['audio-src-x','audio-src-y','audio-src-z'].forEach(function(id) {
+  document.getElementById(id).addEventListener('input', _applyAudioSource);
+});
+document.getElementById('audio-debug-cube').addEventListener('change', function() {
+  if (!(state.rendererModule && state.rendererModule._set_debug_cube_visible)) return;
+  if (this.checked)
+    state.rendererModule.ccall('set_debug_cube_pos', null, ['number','number','number'], [_cfg.x, _cfg.y, _cfg.z]);
+  state.rendererModule.ccall('set_debug_cube_visible', null, ['number'], [this.checked ? 1 : 0]);
+});
+['audio-ref-dist','audio-max-dist','audio-rolloff','audio-model'].forEach(function(id) {
+  document.getElementById(id).addEventListener('input', _applyAudioPanner);
+});

@@ -231,6 +231,13 @@ static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
 
 static bool g_move[4] = {};  // W S A D
 
+// ── Debug cube (audio source visualiser) ─────────────────────────────────────
+static GLuint g_flat_prog   = 0;
+static int    g_flat_a_pos  = -1, g_flat_u_mvp = -1, g_flat_u_color = -1;
+static GLuint g_cube_vbo    = 0;
+static float  g_debug_pos[3] = {};
+static bool   g_debug_visible = false;
+
 // Frame dimensions — set by set_frame_size() and used by CRT shader uniforms
 static unsigned g_frame_w = 160, g_frame_h = 144;
 
@@ -782,6 +789,33 @@ static void gl_init() {
     glEnable(GL_CULL_FACE);
     glFrontFace(GL_CW);  // Y-flip correction reverses winding order
 
+    // Flat-color shader for debug cube
+    {
+        GLuint vs = make_shader(GL_VERTEX_SHADER,  VS_FLAT);
+        GLuint fs = make_shader(GL_FRAGMENT_SHADER, FS_FLAT);
+        g_flat_prog = glCreateProgram();
+        glAttachShader(g_flat_prog, vs); glAttachShader(g_flat_prog, fs);
+        glLinkProgram(g_flat_prog);
+        glDeleteShader(vs); glDeleteShader(fs);
+        g_flat_a_pos   = glGetAttribLocation (g_flat_prog, "a_pos");
+        g_flat_u_mvp   = glGetUniformLocation(g_flat_prog, "u_mvp");
+        g_flat_u_color = glGetUniformLocation(g_flat_prog, "u_color");
+    }
+    // Cube wireframe VBO: 12 edges listed as 24 GL_LINES verts, half-size 5
+    {
+        static const float cv[] = {
+            -5,-5,-5,  5,-5,-5,   5,-5,-5,  5,-5, 5,
+             5,-5, 5, -5,-5, 5,  -5,-5, 5, -5,-5,-5,
+            -5, 5,-5,  5, 5,-5,   5, 5,-5,  5, 5, 5,
+             5, 5, 5, -5, 5, 5,  -5, 5, 5, -5, 5,-5,
+            -5,-5,-5, -5, 5,-5,   5,-5,-5,  5, 5,-5,
+             5,-5, 5,  5, 5, 5,  -5,-5, 5, -5, 5, 5,
+        };
+        glGenBuffers(1, &g_cube_vbo);
+        glBindBuffer(GL_ARRAY_BUFFER, g_cube_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(cv), cv, GL_STATIC_DRAW);
+    }
+
     load_tv();
     for (const auto& p : g_prims)
         if (p.is_screen) {
@@ -1073,6 +1107,26 @@ static void render() {
 
     render_scene(vp, scaled_col, cone_dir);
     render_avatars(vp, scaled_col, cone_dir);
+
+    // Debug cube — audio source visualiser
+    if (g_debug_visible && g_flat_prog && g_cube_vbo) {
+        M4 model, mvp;
+        m4_identity(model);
+        model[12] = g_debug_pos[0];
+        model[13] = g_debug_pos[1];
+        model[14] = g_debug_pos[2];
+        m4_mul(mvp, vp, model);
+        glUseProgram(g_flat_prog);
+        glUniformMatrix4fv(g_flat_u_mvp, 1, GL_FALSE, mvp);
+        glUniform3f(g_flat_u_color, 1.f, 0.85f, 0.f);  // bright yellow
+        glBindBuffer(GL_ARRAY_BUFFER, g_cube_vbo);
+        glEnableVertexAttribArray(g_flat_a_pos);
+        glVertexAttribPointer(g_flat_a_pos, 3, GL_FLOAT, GL_FALSE, 0, 0);
+        glDisable(GL_DEPTH_TEST);
+        glDrawArrays(GL_LINES, 0, 24);
+        glEnable(GL_DEPTH_TEST);
+        glDisableVertexAttribArray(g_flat_a_pos);
+    }
 }
 
 // ============================================================
@@ -1155,6 +1209,13 @@ extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_y() {
 extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_z() {
     for (const auto& p : g_prims) if (p.is_screen) return p.world[14];
     return 0.f;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_debug_cube_pos(float x, float y, float z) {
+    g_debug_pos[0] = x; g_debug_pos[1] = y; g_debug_pos[2] = z;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_debug_cube_visible(int v) {
+    g_debug_visible = (v != 0);
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_pitch() { return g_local.pitch; }

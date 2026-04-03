@@ -5,10 +5,84 @@
 import { state, shareCanvas, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
+import { getGameAudioTrack, startViewerAudio, setAudioSourcePos, setAudioPannerSettings } from './audio.js';
 
 let peerInst = null;
 let mpConns  = [];
 let gameStream = null;
+
+// ── Scene state ──────────────────────────────────────────────
+function getSceneState() {
+  const v = id => document.getElementById(id);
+  return {
+    type:         'scene',
+    overscanX:    parseFloat(v('overscan-x').value),
+    overscanY:    parseFloat(v('overscan-y').value),
+    roomScale:    parseFloat(v('room-scale').value),
+    roomRotY:     parseFloat(v('room-roty').value) || 0,
+    roomTx:       parseFloat(v('room-tx').value)   || 0,
+    roomTy:       parseFloat(v('room-ty').value)   || 0,
+    roomTz:       parseFloat(v('room-tz').value)   || 0,
+    lampX:        parseFloat(v('lamp-x').value)    || 0,
+    lampY:        parseFloat(v('lamp-y').value)    || 0,
+    lampZ:        parseFloat(v('lamp-z').value)    || 0,
+    lampIntensity: parseFloat(v('lamp-intensity').value),
+    tvIntensity:  parseFloat(v('tv-intensity').value),
+    coneYaw:      parseFloat(v('cone-yaw').value),
+    conePitch:    parseFloat(v('cone-pitch').value),
+    conePower:    parseFloat(v('cone-power').value),
+    audioX:       parseFloat(v('audio-src-x').value) || 0,
+    audioY:       parseFloat(v('audio-src-y').value) || 0,
+    audioZ:       parseFloat(v('audio-src-z').value) || 0,
+    audioRefDist:    parseFloat(v('audio-ref-dist').value),
+    audioMaxDist:    parseFloat(v('audio-max-dist').value),
+    audioRolloff:    parseFloat(v('audio-rolloff').value),
+    audioModel:      v('audio-model').value,
+    audioCubeVisible: document.getElementById('audio-debug-cube').checked ? 1 : 0,
+  };
+}
+
+function applySceneState(s) {
+  const set = (id, val) => { const el = document.getElementById(id); if (el) el.value = val; };
+  const txt = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+  set('overscan-x', s.overscanX);        set('overscan-y', s.overscanY);
+  set('room-scale', s.roomScale);        txt('room-scale-val', s.roomScale);
+  set('room-roty', s.roomRotY);
+  set('room-tx', s.roomTx);             set('room-ty', s.roomTy);          set('room-tz', s.roomTz);
+  set('lamp-x', s.lampX);               set('lamp-y', s.lampY);            set('lamp-z', s.lampZ);
+  set('lamp-intensity', s.lampIntensity); txt('lamp-intensity-val', s.lampIntensity);
+  set('tv-intensity', s.tvIntensity);   txt('tv-intensity-val', s.tvIntensity);
+  set('cone-yaw', s.coneYaw);           set('cone-pitch', s.conePitch);    set('cone-power', s.conePower);
+  set('audio-src-x', s.audioX);         set('audio-src-y', s.audioY);      set('audio-src-z', s.audioZ);
+  set('audio-ref-dist', s.audioRefDist); txt('audio-ref-dist-val', s.audioRefDist);
+  set('audio-max-dist', s.audioMaxDist); txt('audio-max-dist-val', s.audioMaxDist);
+  set('audio-rolloff', s.audioRolloff);  txt('audio-rolloff-val', s.audioRolloff);
+  const mdl = document.getElementById('audio-model'); if (mdl) mdl.value = s.audioModel;
+
+  if (state.rendererModule) {
+    const M = state.rendererModule;
+    M.ccall('set_overscan',          null, ['number','number'],                         [s.overscanX, s.overscanY]);
+    M.ccall('set_room_xform',        null, ['number','number','number','number','number'],[s.roomScale, s.roomRotY, s.roomTx, s.roomTy, s.roomTz]);
+    M.ccall('set_lamp_pos',          null, ['number','number','number'],                [s.lampX, s.lampY, s.lampZ]);
+    M.ccall('set_lamp_intensity',    null, ['number'],                                  [s.lampIntensity]);
+    M.ccall('set_tv_light_intensity',null, ['number'],                                  [s.tvIntensity]);
+    M.ccall('set_cone_yaw',          null, ['number'],                                  [s.coneYaw]);
+    M.ccall('set_cone_pitch',        null, ['number'],                                  [s.conePitch]);
+    M.ccall('set_cone_power',        null, ['number'],                                  [s.conePower]);
+  }
+  setAudioSourcePos(s.audioX, s.audioY, s.audioZ);
+  setAudioPannerSettings(s.audioRefDist, s.audioMaxDist, s.audioRolloff, s.audioModel);
+  const cubeEl = document.getElementById('audio-debug-cube');
+  if (cubeEl) cubeEl.checked = !!s.audioCubeVisible;
+  if (state.rendererModule && state.rendererModule._set_debug_cube_visible)
+    state.rendererModule.ccall('set_debug_cube_visible', null, ['number'], [s.audioCubeVisible ? 1 : 0]);
+}
+
+export function broadcastScene() {
+  if (!state.mpIsHost) return;
+  const s = getSceneState();
+  mpConns.forEach(function(c) { if (c.open) c.send(s); });
+}
 
 function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
@@ -109,6 +183,7 @@ export function mpHost() {
     mpConns.push(conn);
     const remoteId = mpConns.length - 1;
     conn.on('open', function() {
+      conn.send(getSceneState());
       mpSetStatus('Guest connected');
       startPositionSync(conn);
     });
@@ -119,6 +194,8 @@ export function mpHost() {
           [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
         state.rendererModule.ccall('set_remote_player_model', 'void',
           ['number','number'], [remoteId, data.model || 0]);
+      } else if (data.type === 'scene') {
+        applySceneState(data);
       }
     });
     conn.on('close', function() {
@@ -129,7 +206,10 @@ export function mpHost() {
     });
   });
   peerInst.on('call', function(call) {
-    call.answer(gameStream || new MediaStream(), { sdpTransform: preferH264Baseline });
+    const tracks = gameStream ? [...gameStream.getTracks()] : [];
+    const audioTrack = getGameAudioTrack();
+    if (audioTrack) tracks.push(audioTrack);
+    call.answer(new MediaStream(tracks), { sdpTransform: preferH264Baseline });
     call.on('stream', function() {
       applyLowLatencyEncoding(call.peerConnection);
     });
@@ -147,6 +227,7 @@ export function mpJoin() {
     // Data channel for position sync
     const conn = peerInst.connect(hostId, { reliable: false });
     conn.on('open', function() {
+      document.querySelector('.scene-section').style.display = 'none';
       mpSetStatus('In room with ' + hostId);
       startPositionSync(conn);
     });
@@ -157,27 +238,38 @@ export function mpJoin() {
           [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
         state.rendererModule.ccall('set_remote_player_model', 'void',
           ['number','number'], [0, data.model || 0]);
+      } else if (data.type === 'scene') {
+        applySceneState(data);
       }
     });
     conn.on('close', function() {
+      document.querySelector('.scene-section').style.display = '';
       if (state.rendererModule)
         state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [0]);
       mpSetStatus('Host disconnected');
     });
 
-    // Video — caller must include a video track in the offer so the SDP has a
-    // video section; otherwise the answerer (host) can't send their stream back.
+    // Caller must include tracks for every media type it wants to receive back.
+    // A video-only offer means the host can't send audio, so add a silent audio
+    // track too so the SDP gets an m=audio section.
     const dummyCanvas = document.createElement('canvas');
     dummyCanvas.width = 2; dummyCanvas.height = 2;
-    const callStream = dummyCanvas.captureStream
-      ? dummyCanvas.captureStream(1)
-      : new MediaStream();
+    const callTracks = dummyCanvas.captureStream ? [...dummyCanvas.captureStream(1).getTracks()] : [];
+    try {
+      const silentCtx = new AudioContext();
+      const silentDest = silentCtx.createMediaStreamDestination();
+      const silentTrack = silentDest.stream.getAudioTracks()[0];
+      if (silentTrack) callTracks.push(silentTrack);
+    } catch(e) {}
+    const callStream = new MediaStream(callTracks);
     const call = peerInst.call(hostId, callStream, { sdpTransform: preferH264Baseline });
     call.on('stream', function(stream) {
       const vTracks = stream.getVideoTracks();
       if (!vTracks.length) { mpSetStatus('No video track received'); return; }
       mpSetStatus('Receiving game from ' + hostId);
       applyLowLatencyEncoding(call.peerConnection);
+      const aTracks = stream.getAudioTracks();
+      if (aTracks.length) startViewerAudio(aTracks[0]);
       setupVideoReceive(new MediaStream(vTracks));
     });
     call.on('error', e => mpSetStatus('Call error: ' + e));

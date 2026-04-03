@@ -347,3 +347,19 @@ void main() {
     gl_FragColor = vec4(mul_res, 1.0);
 }
 )";
+
+
+// ============================================================
+//  Flat-color shader — used for debug wireframe overlays
+// ============================================================
+static const char* VS_FLAT = R"(
+attribute vec3 a_pos;
+uniform mat4 u_mvp;
+void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }
+)";
+
+static const char* FS_FLAT = R"(
+precision mediump float;
+uniform vec3 u_color;
+void main() { gl_FragColor = vec4(u_color, 1.0); }
+)";
