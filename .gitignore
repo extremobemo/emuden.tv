@@ -2,6 +2,8 @@
 game*.js
 game*.wasm
 game*.data
+core_*.js
+core_*.wasm
 n64wasm.js
 n64wasm.wasm
 assets.zip
