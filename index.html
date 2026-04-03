@@ -66,7 +66,11 @@
   <label>PS1 BIOS
     <input type="file" id="bios-input" accept=".bin" hidden>
   </label>
-  &nbsp; <span id="status">No ROM loaded</span>
+  &nbsp;
+  <label>GBA Save
+    <input type="file" id="gba-save-input" accept=".sav,.srm" hidden>
+  </label>
+  &nbsp; <span id="status">Loading room...</span>
   &nbsp;&nbsp;
   <label style="font:11px monospace;color:#aaa">Overscan X
     <input type="range" id="overscan-x" min="-0.3" max="0.4" step="0.005" value="0.04"
@@ -158,9 +162,9 @@
 const canvas = document.getElementById('canvas');
 const overlay = document.getElementById('overlay');
 
-// Size canvas to ~90% of window, 16:9
+// Size canvas to ~75% of window width, 16:9
 (function sizeCanvas() {
-  const pad = 80; // space for UI bar below
+  const pad = 80;
   const maxW = Math.round(window.innerWidth * 0.75);
   const maxH = window.innerHeight - pad;
   const aspect = 16 / 9;
@@ -174,74 +178,90 @@ const overlay = document.getElementById('overlay');
   Object.defineProperty(canvas, 'height', { get: () => h, set: () => {} });
 })();
 
+// ── Module / worker state ─────────────────────────────────────
+let rendererModule = null;  // game_renderer.js — always loaded on page open
+let coreModule     = null;  // alias for rendererModule; all existing ccall paths work unchanged
+let coreWorker     = null;  // active Web Worker running the current libretro core
+let n64Module      = null;
+let n64Running     = false;
+
+// ── Multiplayer state ─────────────────────────────────────────
+let frontendGL  = null;   // Emscripten GL table captured from renderer load
+let frontendCtx = null;   // WebGL2 context of #canvas
+let peerInst    = null;
+let mpConns     = [];
+let gameStream  = null;
+let mpIsHost    = false;
+
+// Hidden canvas that holds the latest game frame for WebRTC video
+const shareCanvas = document.createElement('canvas');
+shareCanvas.width = 640; shareCanvas.height = 480;
+const shareCtx = shareCanvas.getContext('2d');
+
+// Scratch canvas used to scale frames into shareCanvas
+const frameTmp = document.createElement('canvas');
+let   frameTmpCtx = null;
+
 // ── Audio state ───────────────────────────────────────────────
 let audioCtx    = null;
 let audioNode   = null;
 let audioPanner = null;
-let audioReadPos = 0;
-let audioBufBase = 0;
-let audioBufSize = 0;
 
-function startAudio() {
-  if (!coreModule) return;
-  const rate = coreModule._get_audio_sample_rate();
+// JS ring buffer — fed by receiveAudio() from worker, drained by ScriptProcessorNode
+const AUDIO_RING  = 44100 * 4;   // 2 seconds stereo capacity at max rate
+const audioRing   = new Float32Array(AUDIO_RING);
+let audioRingWrite = 0;
+let audioRingRead  = 0;
+
+function startAudio(sampleRate) {
   // Close previous context if sample rate changed (different core)
-  if (audioCtx && audioCtx.sampleRate !== rate) {
+  if (audioCtx && audioCtx.sampleRate !== sampleRate) {
     audioCtx.close();
-    audioCtx = null;
-    audioNode = null;
-    audioPanner = null;
+    audioCtx = null; audioNode = null; audioPanner = null;
   }
   if (!audioCtx) {
-    try {
-      audioCtx = new AudioContext({ sampleRate: rate });
-    } catch(e) {
-      audioCtx = new AudioContext(); // fallback: browser default rate
-    }
+    try { audioCtx = new AudioContext({ sampleRate: sampleRate }); }
+    catch(e) { audioCtx = new AudioContext(); }
   }
   if (audioCtx.state === 'suspended') audioCtx.resume();
-  // Reset read position to current write position so we don't replay old samples
-  audioBufBase = coreModule._get_audio_buf_ptr() >> 1; // HEAP16 index
-  audioBufSize = coreModule._get_audio_buf_size();
-  audioReadPos = coreModule._get_audio_write_pos();
+  // Reset ring buffer so we don't play stale samples from a previous core
+  audioRingWrite = 0; audioRingRead = 0;
 
-  if (audioNode) return; // already created for this context
+  if (audioNode) return; // ScriptProcessor already wired for this context
 
   // ── PannerNode: audio source fixed at the TV's world position ──
   audioPanner = audioCtx.createPanner();
-  audioPanner.panningModel  = 'HRTF';      // binaural head-related transfer
+  audioPanner.panningModel  = 'HRTF';
   audioPanner.distanceModel = 'inverse';
-  audioPanner.refDistance   = 80;          // full volume at ~player start distance
+  audioPanner.refDistance   = 80;
   audioPanner.maxDistance   = 2000;
   audioPanner.rolloffFactor = 4;
 
-  // TV doesn't move — set its position once
-  const tvx = coreModule._get_tv_x();
-  const tvy = coreModule._get_tv_y();
-  const tvz = coreModule._get_tv_z();
-  if (audioPanner.positionX !== undefined) {
-    audioPanner.positionX.value = tvx;
-    audioPanner.positionY.value = tvy;
-    audioPanner.positionZ.value = tvz;
-  } else {
-    audioPanner.setPosition(tvx, tvy, tvz);
+  if (rendererModule) {
+    const tvx = rendererModule._get_tv_x();
+    const tvy = rendererModule._get_tv_y();
+    const tvz = rendererModule._get_tv_z();
+    if (audioPanner.positionX !== undefined) {
+      audioPanner.positionX.value = tvx;
+      audioPanner.positionY.value = tvy;
+      audioPanner.positionZ.value = tvz;
+    } else {
+      audioPanner.setPosition(tvx, tvy, tvz);
+    }
   }
 
   // 4096-sample ScriptProcessor, no inputs, 2 stereo output channels
   audioNode = audioCtx.createScriptProcessor(4096, 0, 2);
   audioNode.onaudioprocess = function(ev) {
-    if (!coreModule || !audioBufSize) return;
-    const wp  = coreModule._get_audio_write_pos();
-    const h16 = coreModule.HEAP16;
-    const L   = ev.outputBuffer.getChannelData(0);
-    const R   = ev.outputBuffer.getChannelData(1);
+    const L = ev.outputBuffer.getChannelData(0);
+    const R = ev.outputBuffer.getChannelData(1);
     for (let i = 0; i < L.length; i++) {
-      const avail = (wp - audioReadPos + audioBufSize) % audioBufSize;
-      if (avail < 2) { L[i] = R[i] = 0; continue; }
-      L[i] = h16[audioBufBase + audioReadPos] / 32768.0;
-      audioReadPos = (audioReadPos + 1) % audioBufSize;
-      R[i] = h16[audioBufBase + audioReadPos] / 32768.0;
-      audioReadPos = (audioReadPos + 1) % audioBufSize;
+      if (audioRingWrite - audioRingRead >= 2) {
+        L[i] = audioRing[audioRingRead % AUDIO_RING]; audioRingRead++;
+        R[i] = audioRing[audioRingRead % AUDIO_RING]; audioRingRead++;
+      } else {
+        L[i] = R[i] = 0;
+      }
     }
   };
 
@@ -249,20 +269,18 @@ function startAudio() {
   audioNode.connect(audioPanner);
   audioPanner.connect(audioCtx.destination);
 
-  // Per-frame listener (player ears) update
+  // Per-frame listener (player ears) update driven by renderer position
   (function updateListener() {
-    if (audioCtx && coreModule) {
-      const lx  = coreModule._get_local_x();
-      const ly  = coreModule._get_local_y();
-      const lz  = coreModule._get_local_z();
-      const yaw = coreModule._get_local_yaw();
-      const pit = coreModule._get_local_pitch();
-      // Forward vector from yaw + pitch
+    if (audioCtx && rendererModule) {
+      const lx  = rendererModule._get_local_x();
+      const ly  = rendererModule._get_local_y();
+      const lz  = rendererModule._get_local_z();
+      const yaw = rendererModule._get_local_yaw();
+      const pit = rendererModule._get_local_pitch();
       const cosPit = Math.cos(pit);
       const fx = cosPit * Math.sin(yaw);
       const fy = Math.sin(pit);
       const fz = cosPit * Math.cos(yaw);
-      // Up vector (perpendicular to forward, always world-up biased)
       const listener = audioCtx.listener;
       if (listener.positionX !== undefined) {
         listener.positionX.value = lx;
@@ -281,88 +299,122 @@ function startAudio() {
   })();
 }
 
-// ── Multiplayer state ─────────────────────────────────────────
-let frontendGL  = null;   // Emscripten GL table (captured after core loads)
-let frontendCtx = null;   // WebGL1 context of #canvas
-let peerInst    = null;
-let mpConns     = [];     // active DataConnections
-let gameStream  = null;   // MediaStream sent as host
-let mpIsHost    = false;
+// ── Worker message handler ────────────────────────────────────
+function onWorkerMessage(e) {
+  const msg = e.data;
+  if (msg.type === 'ready') {
+    startAudio(msg.sampleRate);
+    setStatus('Playing');
+  } else if (msg.type === 'frame') {
+    receiveFrame(msg.buf, msg.w, msg.h);
+  } else if (msg.type === 'audio') {
+    receiveAudio(msg.samples);
+  }
+}
 
-// Hidden canvas that always holds the latest game frame (for WebRTC video)
-const shareCanvas = document.createElement('canvas');
-shareCanvas.width = 640; shareCanvas.height = 480;
-const shareCtx = shareCanvas.getContext('2d');
+function receiveAudio(buf) {
+  const s = new Int16Array(buf);
+  for (let i = 0; i < s.length; i++) {
+    audioRing[audioRingWrite % AUDIO_RING] = s[i] / 32768.0;
+    audioRingWrite++;
+  }
+}
 
+// Sample 4 quadrant average colors from a raw RGBA buffer and push to renderer.
+// Used by libretro core frames (replaces canvas-based jsUpdateQuadColors for this path).
+function jsUpdateQuadColors_fromBuffer(rgba, fw, fh) {
+  if (!rendererModule) return;
+  const hw = fw >> 1, hh = fh >> 1;
+  // q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
+  const regions = [
+    [0,  hw, hh, fh],
+    [hw, fw, hh, fh],
+    [0,  hw, 0,  hh],
+    [hw, fw, 0,  hh]
+  ];
+  const cols = [];
+  for (const [x0, x1, y0, y1] of regions) {
+    let r = 0, g = 0, b = 0, cnt = 0;
+    for (let y = y0; y < y1; y += 4)
+      for (let x = x0; x < x1; x += 4) {
+        const i = (y * fw + x) * 4;
+        r += rgba[i]; g += rgba[i+1]; b += rgba[i+2]; cnt++;
+      }
+    cols.push(r/(cnt*255), g/(cnt*255), b/(cnt*255));
+  }
+  rendererModule.ccall('set_tv_quad_colors', null, Array(12).fill('number'), cols);
+}
+
+function receiveFrame(buf, fw, fh) {
+  if (!rendererModule || !frontendGL || !frontendCtx) return;
+  rendererModule.ccall('set_frame_size', 'void', ['number','number'], [fw, fh]);
+  const texId = rendererModule.ccall('get_game_tex_id', 'number', [], []);
+  const tex = frontendGL.textures[texId];
+  if (!tex) return;
+
+  const rgba = new Uint8ClampedArray(buf, 0, fw * fh * 4);
+  frontendCtx.bindTexture(frontendCtx.TEXTURE_2D, tex);
+  frontendCtx.texImage2D(frontendCtx.TEXTURE_2D, 0,
+    frontendCtx.RGBA, fw, fh, 0, frontendCtx.RGBA, frontendCtx.UNSIGNED_BYTE, rgba);
+  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D, frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
+  frontendCtx.texParameteri(frontendCtx.TEXTURE_2D, frontendCtx.TEXTURE_MAG_FILTER, frontendCtx.LINEAR);
+
+  jsUpdateQuadColors_fromBuffer(rgba, fw, fh);
+
+  // Mirror to shareCanvas for WebRTC host streaming
+  if (mpIsHost) {
+    if (frameTmp.width !== fw || frameTmp.height !== fh) {
+      frameTmp.width = fw; frameTmp.height = fh;
+      frameTmpCtx = frameTmp.getContext('2d');
+    }
+    frameTmpCtx.putImageData(new ImageData(rgba, fw, fh), 0, 0);
+    shareCtx.drawImage(frameTmp, 0, 0, 640, 480);
+  }
+}
+
+// ── Multiplayer helpers ───────────────────────────────────────
 function mpSetStatus(msg) {
   document.getElementById('mp-status').textContent = msg;
 }
 
-// Sample a video source (canvas or video element) into 4 quadrant average
-// colours and write them directly into the C++ g_tv_quad_col buffer.
-// Used by N64 and guest-stream modes where g_frame_rgba is never populated.
+// Sample a video source (canvas or video element) into 4 quadrant average colours.
+// Used by N64 and guest-stream modes where frames don't come through receiveFrame.
 const _quadSampleCanvas = document.createElement('canvas');
 _quadSampleCanvas.width = 2; _quadSampleCanvas.height = 2;
 const _quadSampleCtx = _quadSampleCanvas.getContext('2d', { willReadFrequently: true });
 function jsUpdateQuadColors(source) {
-  if (!coreModule) return;
+  if (!rendererModule) return;
   try {
     _quadSampleCtx.drawImage(source, 0, 0, 2, 2);
     const d = _quadSampleCtx.getImageData(0, 0, 2, 2).data;
-    // 2×2 pixel layout (canvas y=0 is top):
-    //   d[0..3]=TL  d[4..7]=TR  d[8..11]=BL  d[12..15]=BR
+    // 2×2 layout (y=0 top): d[0..3]=TL d[4..7]=TR d[8..11]=BL d[12..15]=BR
     // Must match C++ quad order: q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
-    coreModule.ccall('set_tv_quad_colors', null,
+    rendererModule.ccall('set_tv_quad_colors', null,
       ['number','number','number','number','number','number',
        'number','number','number','number','number','number'],
-      [d[8]/255, d[9]/255, d[10]/255,    // q0 BL
-       d[12]/255,d[13]/255,d[14]/255,    // q1 BR
-       d[0]/255, d[1]/255, d[2]/255,     // q2 TL
-       d[4]/255, d[5]/255, d[6]/255]);   // q3 TR
+      [d[8]/255,  d[9]/255,  d[10]/255,   // q0 BL
+       d[12]/255, d[13]/255, d[14]/255,   // q1 BR
+       d[0]/255,  d[1]/255,  d[2]/255,    // q2 TL
+       d[4]/255,  d[5]/255,  d[6]/255]);  // q3 TR
   } catch(e) { console.warn('jsUpdateQuadColors:', e); }
 }
 
-// Copy libretro frame from WASM heap → shareCanvas each animation frame.
-// Frames are scaled to fill the full 640×480 shareCanvas so the receiver
-// sees a full-TV image regardless of the core's native resolution.
-const frameTmp = document.createElement('canvas');
-let   frameTmpCtx = null;
+// Start capturing game frames into shareCanvas for WebRTC streaming.
+// Actual blit happens inside receiveFrame() (libretro) or the N64 copyLoop.
 function startFrameCapture() {
-  (function loop() {
-    if (coreModule) {
-      const ptr = coreModule.ccall('get_frame_ptr', 'number', [], []);
-      if (ptr) {
-        const fw = coreModule.ccall('get_frame_w', 'number', [], []);
-        const fh = coreModule.ccall('get_frame_h', 'number', [], []);
-        if (fw > 0 && fh > 0) {
-          // Resize scratch canvas if resolution changed
-          if (frameTmp.width !== fw || frameTmp.height !== fh) {
-            frameTmp.width = fw; frameTmp.height = fh;
-            frameTmpCtx = frameTmp.getContext('2d');
-          }
-          const raw = new Uint8ClampedArray(coreModule.HEAPU8.buffer, ptr, fw * fh * 4);
-          frameTmpCtx.putImageData(new ImageData(new Uint8ClampedArray(raw), fw, fh), 0, 0);
-          // Scale to fill 640×480 for the stream
-          shareCtx.drawImage(frameTmp, 0, 0, 640, 480);
-        }
-      }
-    }
-    requestAnimationFrame(loop);
-  })();
   gameStream = shareCanvas.captureStream(30);
 }
 
-// Blit received video stream into the TV texture (same pattern as N64)
+// Blit received video stream into the TV texture (guest-side WebRTC receive)
 function setupVideoReceive(stream) {
   const videoEl = document.createElement('video');
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
   videoEl.srcObject = stream;
   videoEl.play().catch(e => console.warn('mp video:', e));
 
-  const texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
-  coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
-  // JS (jsUpdateQuadColors) owns the quad colors — skip C++ sampling from g_frame_rgba
-  coreModule.ccall('set_js_colors', 'void', ['number'], [1]);
+  const texId = rendererModule.ccall('get_game_tex_id', 'number', [], []);
+  rendererModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  rendererModule.ccall('set_js_colors', 'void', ['number'], [1]);
   (function blitLoop() {
     if (videoEl.readyState >= 2 && frontendGL && frontendCtx) {
       const tex = frontendGL.textures[texId];
@@ -381,13 +433,13 @@ function setupVideoReceive(stream) {
 
 function startPositionSync(conn) {
   setInterval(function() {
-    if (!conn.open || !coreModule) return;
+    if (!conn.open || !rendererModule) return;
     conn.send({ type: 'pos',
-      x:      coreModule.ccall('get_local_x',      'number', [], []),
-      y:      coreModule.ccall('get_local_y',      'number', [], []),
-      z:      coreModule.ccall('get_local_z',      'number', [], []),
-      yaw:    coreModule.ccall('get_local_yaw',    'number', [], []),
-      moving: coreModule.ccall('get_local_moving', 'number', [], [])
+      x:      rendererModule.ccall('get_local_x',      'number', [], []),
+      y:      rendererModule.ccall('get_local_y',      'number', [], []),
+      z:      rendererModule.ccall('get_local_z',      'number', [], []),
+      yaw:    rendererModule.ccall('get_local_yaw',    'number', [], []),
+      moving: rendererModule.ccall('get_local_moving', 'number', [], [])
     });
   }, 50); // 20 Hz
 }
@@ -408,13 +460,13 @@ function mpHost() {
       startPositionSync(conn);
     });
     conn.on('data', function(data) {
-      if (data.type === 'pos' && coreModule)
-        coreModule.ccall('set_remote_player', 'void',
+      if (data.type === 'pos' && rendererModule)
+        rendererModule.ccall('set_remote_player', 'void',
           ['number','number','number','number','number','number'],
           [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
     });
     conn.on('close', function() {
-      if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[remoteId]);
+      if (rendererModule) rendererModule.ccall('remove_remote_player','void',['number'],[remoteId]);
       mpConns.splice(mpConns.indexOf(conn), 1);
       mpSetStatus('Guest disconnected');
     });
@@ -428,74 +480,65 @@ function mpJoin() {
   const hostId = document.getElementById('join-id').value.trim();
   if (!hostId) { mpSetStatus('Enter a peer ID first'); return; }
   mpIsHost = false;
-  mpSetStatus('Loading scene...');
-
-  // Guest just needs the 3D room — load game_gbc.js without a ROM
-  loadCore('game_gbc.js', function() {
-    mpSetStatus('Connecting...');
-    peerInst = new Peer();
-    peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
-    peerInst.on('open', function() {
-      // Data channel for positions
-      const conn = peerInst.connect(hostId, { reliable: false });
-      conn.on('open', function() {
-        mpSetStatus('In room with ' + hostId);
-        startPositionSync(conn);
-      });
-      conn.on('data', function(data) {
-        if (data.type === 'pos' && coreModule)
-          coreModule.ccall('set_remote_player', 'void',
-            ['number','number','number','number','number','number'],
-            [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
-      });
-      conn.on('close', function() {
-        if (coreModule) coreModule.ccall('remove_remote_player','void',['number'],[0]);
-        mpSetStatus('Host disconnected');
-      });
-
-      // Video — caller must include a video track in the offer so the SDP has a
-      // video section; otherwise the answerer (host) can't send their stream back.
-      const dummyCanvas = document.createElement('canvas');
-      dummyCanvas.width = 2; dummyCanvas.height = 2;
-      const callStream = dummyCanvas.captureStream
-        ? dummyCanvas.captureStream(1)
-        : new MediaStream();
-      const call = peerInst.call(hostId, callStream);
-      call.on('stream', function(stream) {
-        // Use only the host's video track(s)
-        const vTracks = stream.getVideoTracks();
-        if (!vTracks.length) { mpSetStatus('No video track received'); return; }
-        mpSetStatus('Receiving game from ' + hostId);
-        setupVideoReceive(new MediaStream(vTracks));
-      });
-      call.on('error', e => mpSetStatus('Call error: ' + e));
+  // Renderer is already loaded — connect directly without loading a core bundle
+  mpSetStatus('Connecting...');
+  peerInst = new Peer();
+  peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
+  peerInst.on('open', function() {
+    // Data channel for position sync
+    const conn = peerInst.connect(hostId, { reliable: false });
+    conn.on('open', function() {
+      mpSetStatus('In room with ' + hostId);
+      startPositionSync(conn);
     });
+    conn.on('data', function(data) {
+      if (data.type === 'pos' && rendererModule)
+        rendererModule.ccall('set_remote_player', 'void',
+          ['number','number','number','number','number','number'],
+          [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
+    });
+    conn.on('close', function() {
+      if (rendererModule) rendererModule.ccall('remove_remote_player','void',['number'],[0]);
+      mpSetStatus('Host disconnected');
+    });
+
+    // Video — caller must include a video track in the offer so the SDP has a
+    // video section; otherwise the answerer (host) can't send their stream back.
+    const dummyCanvas = document.createElement('canvas');
+    dummyCanvas.width = 2; dummyCanvas.height = 2;
+    const callStream = dummyCanvas.captureStream
+      ? dummyCanvas.captureStream(1)
+      : new MediaStream();
+    const call = peerInst.call(hostId, callStream);
+    call.on('stream', function(stream) {
+      const vTracks = stream.getVideoTracks();
+      if (!vTracks.length) { mpSetStatus('No video track received'); return; }
+      mpSetStatus('Receiving game from ' + hostId);
+      setupVideoReceive(new MediaStream(vTracks));
+    });
+    call.on('error', e => mpSetStatus('Call error: ' + e));
   });
 }
 
 // ── Core routing ──────────────────────────────────────────────
 const CORE_MAP = {
-  'gb':  'game_gbc.js',
-  'gbc': 'game_gbc.js',
-  'gba': 'game_gba.js',
-  'sfc': 'game_snes.js',
-  'smc': 'game_snes.js',
-  'fig': 'game_snes.js',
-  'swc': 'game_snes.js',
-  'bs':  'game_snes.js',
-  'bin': 'game_ps1.js',
-  'cue': 'game_ps1.js',
-  'chd': 'game_ps1.js',
-  'img': 'game_ps1.js',
+  'gb':  'core_gbc.js',
+  'gbc': 'core_gbc.js',
+  'gba': 'core_gba.js',
+  'sfc': 'core_snes.js',
+  'smc': 'core_snes.js',
+  'fig': 'core_snes.js',
+  'swc': 'core_snes.js',
+  'bs':  'core_snes.js',
+  'bin': 'core_ps1.js',
+  'cue': 'core_ps1.js',
+  'chd': 'core_ps1.js',
+  'img': 'core_ps1.js',
 };
 const N64_EXTS = new Set(['z64', 'n64', 'v64']);
 const PS1_EXTS = new Set(['bin', 'cue', 'chd', 'img']);
 
-let coreModule = null;   // libretro frontend module (game_gbc.js or game_snes.js)
-let loadedCore = null;
-let n64Module  = null;   // n64wasm module
-let n64Running = false;
-let ps1BiosLoaded = false;  // true once a BIOS file has been written to /system/
+let ps1BiosLoaded = false;
 
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
@@ -505,8 +548,8 @@ window.onerror = function(msg, src, line) {
   setStatus('JS error: ' + msg + ' (' + (src||'').split('/').pop() + ':' + line + ')');
 };
 
-// Inject a script and poll until window.Module.calledRun is true.
-// Saves the GL object BEFORE the new script can overwrite window.GL.
+// Inject a <script> tag and poll until window.Module.calledRun is true.
+// Used for game_renderer.js (main thread) and n64wasm.js.
 function injectAndWait(src, onReady, onError) {
   const s = document.createElement('script');
   s.src = src;
@@ -522,30 +565,38 @@ function injectAndWait(src, onReady, onError) {
   setTimeout(check, 200);
 }
 
-function loadCore(bundle, callback) {
-  if (loadedCore === bundle) { callback(); return; }
-  if (loadedCore !== null || n64Running) {
-    if (!confirm('Loading a different core requires a page reload. Continue?')) return;
-    location.reload();
-    return;
-  }
+// Terminate any running core worker and spin up a new one for the given bundle.
+function spawnCoreWorker(bundle, file, ext) {
+  if (coreWorker) { coreWorker.terminate(); coreWorker = null; }
+  n64Running = false;  // stop N64 copyLoop from blitting over the new core's frames
   setStatus('Loading core...');
-  injectAndWait(bundle, function(mod) {
-    coreModule = mod;
-    loadedCore = bundle;
-    if (!frontendGL) {
-      frontendGL  = window.GL;
-      frontendCtx = document.getElementById('canvas').getContext('webgl2');
+  const reader = new FileReader();
+  reader.onload = function(ev) {
+    coreWorker = new Worker('core_worker.js');
+    coreWorker.onmessage = onWorkerMessage;
+    coreWorker.onerror = function(e) { setStatus('Worker error: ' + (e.message || e)); };
+    const msg = {
+      type:    'load',
+      bundle:  bundle,
+      romName: file.name,
+      romBytes: ev.target.result   // transferred (zero-copy)
+    };
+    if (PS1_EXTS.has(ext) && window._ps1BiosBytes) {
+      msg.biosName  = window._ps1BiosName;
+      msg.biosBytes = window._ps1BiosBytes.buffer.slice(0);  // copy — keep original
     }
-    callback();
-  });
+    if (ext === 'gba' && window._gbaSaveBytes) {
+      msg.saveBytes = window._gbaSaveBytes.buffer.slice(0);
+    }
+    coreWorker.postMessage(msg, [msg.romBytes]);
+  };
+  reader.readAsArrayBuffer(file);
 }
 
 // ── N64 loading ───────────────────────────────────────────────
-// n64wasm.js (Emscripten 2.0.7) uses function/var declarations that conflict
-// with class/let declarations in game_gbc.js (newer Emscripten) in the shared
-// global lexical scope.  Fix: fetch the script as text, wrap it in an IIFE so
-// all its declarations stay local, then expose only Module via window._n64M.
+// n64wasm.js (Emscripten 2.0.7) uses var/function declarations that conflict
+// with let/class in newer Emscripten output.  Fix: fetch as text, wrap in an
+// IIFE, expose only Module via window._n64M.
 function loadN64Wasm(callback) {
   window._n64ModuleInit = {
     canvas: document.getElementById('n64canvas'),
@@ -579,108 +630,91 @@ function loadN64Wasm(callback) {
 }
 
 function loadN64(file) {
-  if (loadedCore !== null || n64Running) {
-    if (!confirm('Loading N64 requires a page reload. Continue?')) return;
+  if (n64Running) {
+    if (!confirm('Loading another N64 ROM requires a page reload. Continue?')) return;
     location.reload();
     return;
   }
-  setStatus('Loading N64 frontend...');
+  // Stop any running libretro worker
+  if (coreWorker) { coreWorker.terminate(); coreWorker = null; }
 
-  // Step 1: load game_gbc.js for the 3D TV scene (no libretro ROM needed)
-  injectAndWait('game_gbc.js', function(frontendMod) {
-    coreModule = frontendMod;
-    loadedCore = 'game_gbc.js';
+  setStatus('Loading N64 emulator...');
 
-    // Save game_gbc's GL table NOW before n64wasm can overwrite window.GL
-    // Use local names that don't shadow the module-level vars, then set both.
-    var n64GL  = window.GL;
-    var n64Ctx = document.getElementById('canvas').getContext('webgl2');
-    if (!frontendGL) { frontendGL = n64GL; frontendCtx = n64Ctx; }
-    var texId = coreModule.ccall('get_game_tex_id', 'number', [], []);
-    // Tell the CRT shader that the game texture is N64-sized, not GBC-sized
-    coreModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
-    // JS (jsUpdateQuadColors) owns the quad colors for N64 — skip C++ sampling
-    coreModule.ccall('set_js_colors', 'void', ['number'], [1]);
+  // Renderer is already loaded — set up game texture for N64 resolution
+  var texId = rendererModule.ccall('get_game_tex_id', 'number', [], []);
+  rendererModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  rendererModule.ccall('set_js_colors', 'void', ['number'], [1]);
 
-    setStatus('Loading N64 emulator...');
+  loadN64Wasm(function(n64Mod) {
+    n64Module = n64Mod;
 
-    // Step 2: load n64wasm isolated in an IIFE
-    loadN64Wasm(function(n64Mod) {
-      n64Module = n64Mod;
+    setStatus('Loading ' + file.name + '...');
+    var reader = new FileReader();
+    reader.onload = function(ev) {
+      var romBytes = new Uint8Array(ev.target.result);
 
-      // Step 3: write ROM and start
-      setStatus('Loading ' + file.name + '...');
-      var reader = new FileReader();
-      reader.onload = function(ev) {
-        var romBytes = new Uint8Array(ev.target.result);
+      // N64Wasm requires assets.zip, config.txt, and cheat.txt before callMain
+      fetch('assets.zip')
+        .then(function(r) { return r.arrayBuffer(); })
+        .then(function(assetsBuf) {
+          var fs = n64Module.FS;
+          fs.writeFile('assets.zip', new Uint8Array(assetsBuf));
 
-        // N64Wasm requires assets.zip, config.txt, and cheat.txt on the
-        // virtual FS before callMain — same as their official demo does.
-        fetch('assets.zip')
-          .then(function(r) { return r.arrayBuffer(); })
-          .then(function(assetsBuf) {
-            var fs = n64Module.FS;
-            fs.writeFile('assets.zip', new Uint8Array(assetsBuf));
+          var cfg = [
+            '12','13','14','15','0','2','9','4','6','5','11','-1','-1','-1','-1',
+            'b','n','y','h','Enter','i','k','j','l','a','q','e','s','d','`',
+            'Up','Down','Left','Right',
+            '0','0','0',   // save files
+            '0','0','1',   // fps, swap sticks, disable audio sync
+            '0','0','0',   // invert Y axis 2/3/4P
+            '0','0','0','0'
+          ].join('\r\n') + '\r\n';
+          fs.writeFile('config.txt', cfg);
+          fs.writeFile('cheat.txt', '');
+          fs.writeFile('custom.v64', romBytes);
 
-            // config.txt format: one value per line, matching WriteConfigFile()
-            // in N64Wasm's script.js (gamepad mappings, keyboard mappings, settings)
-            var cfg = [
-              '12','13','14','15','0','2','9','4','6','5','11','-1','-1','-1','-1',
-              'b','n','y','h','Enter','i','k','j','l','a','q','e','s','d','`',
-              'Up','Down','Left','Right',
-              '0','0','0', // save files
-              '0','0','1', // fps, swap sticks, disable audio sync (1=free-running)
-              '0','0','0', // invert Y axis 2/3/4P
-              '0','0','0','0' // mobile, angrylion, mouse, vbo
-            ].join('\r\n') + '\r\n';
-            fs.writeFile('config.txt', cfg);
-            fs.writeFile('cheat.txt', '');
+          try { new AudioContext().resume(); } catch(e) {}
+          n64Module.callMain(['custom.v64']);
+          n64Running = true;
+          setStatus('Playing: ' + file.name);
 
-            fs.writeFile('custom.v64', romBytes);
-            // Unlock the browser's audio context (user gesture already happened
-            // via the file picker, so this will succeed)
-            try { new AudioContext().resume(); } catch(e) {}
-            n64Module.callMain(['custom.v64']);
-            n64Running = true;
-            setStatus('Playing: ' + file.name);
-
-            // Step 4: copy n64canvas → g_game_tex every frame.
-            // Firefox refuses texImage2D(webgl2Canvas) into a WebGL1 context,
-            // so we blit through an intermediate 2D canvas first.
-            var n64canvas = document.getElementById('n64canvas');
-            var blitCanvas = document.createElement('canvas');
-            blitCanvas.width  = n64canvas.width;
-            blitCanvas.height = n64canvas.height;
-            var blit2d = blitCanvas.getContext('2d');
-            (function copyLoop() {
-              if (n64Running) {
-                var tex = n64GL.textures[texId];
-                if (tex) {
-                  blit2d.drawImage(n64canvas, 0, 0);
-                  jsUpdateQuadColors(blitCanvas);
-                  n64Ctx.bindTexture(n64Ctx.TEXTURE_2D, tex);
-                  n64Ctx.texImage2D(n64Ctx.TEXTURE_2D, 0,
-                    n64Ctx.RGBA, n64Ctx.RGBA,
-                    n64Ctx.UNSIGNED_BYTE, blitCanvas);
-                  n64Ctx.texParameteri(n64Ctx.TEXTURE_2D,
-                    n64Ctx.TEXTURE_MIN_FILTER, n64Ctx.LINEAR);
-                  n64Ctx.texParameteri(n64Ctx.TEXTURE_2D,
-                    n64Ctx.TEXTURE_MAG_FILTER, n64Ctx.LINEAR);
-                  // Mirror to shareCanvas for WebRTC streaming (scaled to fill)
-                  shareCtx.drawImage(blitCanvas, 0, 0, 640, 480);
-                }
+          // Copy n64canvas → g_game_tex every frame via intermediate 2D canvas.
+          // Firefox refuses texImage2D(webgl2Canvas) into a WebGL1 context, so
+          // we go through a 2D canvas first.  frontendGL/frontendCtx were
+          // captured at renderer load time before n64wasm overwrote window.GL.
+          var n64canvas = document.getElementById('n64canvas');
+          var blitCanvas = document.createElement('canvas');
+          blitCanvas.width  = n64canvas.width;
+          blitCanvas.height = n64canvas.height;
+          var blit2d = blitCanvas.getContext('2d');
+          (function copyLoop() {
+            if (n64Running) {
+              var tex = frontendGL.textures[texId];
+              if (tex) {
+                blit2d.drawImage(n64canvas, 0, 0);
+                jsUpdateQuadColors(blitCanvas);
+                frontendCtx.bindTexture(frontendCtx.TEXTURE_2D, tex);
+                frontendCtx.texImage2D(frontendCtx.TEXTURE_2D, 0,
+                  frontendCtx.RGBA, frontendCtx.RGBA,
+                  frontendCtx.UNSIGNED_BYTE, blitCanvas);
+                frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
+                  frontendCtx.TEXTURE_MIN_FILTER, frontendCtx.LINEAR);
+                frontendCtx.texParameteri(frontendCtx.TEXTURE_2D,
+                  frontendCtx.TEXTURE_MAG_FILTER, frontendCtx.LINEAR);
+                // Mirror to shareCanvas for WebRTC streaming
+                shareCtx.drawImage(blitCanvas, 0, 0, 640, 480);
               }
-              requestAnimationFrame(copyLoop);
-            })();
-          })
-          .catch(function() { setStatus('Failed to load assets.zip'); });
-      };
-      reader.readAsArrayBuffer(file);
-    });
+            }
+            requestAnimationFrame(copyLoop);
+          })();
+        })
+        .catch(function() { setStatus('Failed to load assets.zip'); });
+    };
+    reader.readAsArrayBuffer(file);
   });
 }
 
-// ── Pointer lock ─────────────────────────────────────────────
+// ── Pointer lock ──────────────────────────────────────────────
 canvas.addEventListener('click', () => canvas.requestPointerLock());
 
 document.addEventListener('pointerlockchange', () => {
@@ -688,16 +722,15 @@ document.addEventListener('pointerlockchange', () => {
 });
 
 document.addEventListener('mousemove', e => {
-  if (document.pointerLockElement === canvas && coreModule) {
-    coreModule.ccall('add_mouse_delta', 'void', ['number','number'],
+  if (document.pointerLockElement === canvas && rendererModule) {
+    rendererModule.ccall('add_mouse_delta', 'void', ['number','number'],
                  [e.movementX, e.movementY]);
   }
 });
 
-// ── Movement keys (WASD) ─────────────────────────────────────
+// ── Input ─────────────────────────────────────────────────────
 const MOVE_MAP = { 'KeyW':0, 'KeyS':1, 'KeyA':2, 'KeyD':3 };
 
-// ── Game controller keys ──────────────────────────────────────
 // RETRO_DEVICE_ID_JOYPAD: B=0 Y=1 SELECT=2 START=3 UP=4 DOWN=5 LEFT=6 RIGHT=7 A=8
 const GAME_MAP = {
   'ArrowUp':    4,
@@ -707,35 +740,35 @@ const GAME_MAP = {
   'Enter':      3,
   'ShiftLeft':  2,
   'ShiftRight': 2,
-  'KeyZ':       8,  // A button
-  'KeyX':       0,  // B button
-  'KeyQ':      10,  // L
-  'KeyE':      11,  // R
+  'KeyZ':       8,   // A button
+  'KeyX':       0,   // B button
+  'KeyQ':      10,   // L
+  'KeyE':      11,   // R
 };
 
 document.addEventListener('keydown', e => {
-  if (!coreModule) return;
-  if (MOVE_MAP[e.code] !== undefined) {
+  // WASD → renderer (player movement)
+  if (MOVE_MAP[e.code] !== undefined && rendererModule) {
     e.preventDefault();
-    coreModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],1]);
+    rendererModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],1]);
   }
+  // Game buttons → worker (emulator input)
   if (GAME_MAP[e.code] !== undefined) {
     e.preventDefault();
-    coreModule.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],1]);
+    if (coreWorker) coreWorker.postMessage({ type: 'button', id: GAME_MAP[e.code], pressed: true });
   }
 });
 
 document.addEventListener('keyup', e => {
-  if (!coreModule) return;
-  if (MOVE_MAP[e.code] !== undefined)
-    coreModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],0]);
-  if (GAME_MAP[e.code] !== undefined)
-    coreModule.ccall('set_button','void',['number','number'],[GAME_MAP[e.code],0]);
+  if (MOVE_MAP[e.code] !== undefined && rendererModule)
+    rendererModule.ccall('set_move_key','void',['number','number'],[MOVE_MAP[e.code],0]);
+  if (GAME_MAP[e.code] !== undefined && coreWorker)
+    coreWorker.postMessage({ type: 'button', id: GAME_MAP[e.code], pressed: false });
 });
 
-// ── PS1 BIOS loading ──────────────────────────────────────────
+// ── Sliders ───────────────────────────────────────────────────
 function applyRoomXform() {
-  if (!coreModule || !coreModule._set_room_xform) return;
+  if (!coreModule) return;
   const scale = parseFloat(document.getElementById('room-scale').value);
   const rotY  = parseFloat(document.getElementById('room-roty').value) || 0;
   const tx    = parseFloat(document.getElementById('room-tx').value)   || 0;
@@ -750,7 +783,7 @@ function applyRoomXform() {
 });
 
 function applyOverscan() {
-  if (!coreModule || !coreModule._set_overscan) return;
+  if (!coreModule) return;
   const x = parseFloat(document.getElementById('overscan-x').value);
   const y = parseFloat(document.getElementById('overscan-y').value);
   coreModule.ccall('set_overscan', null, ['number', 'number'], [x, y]);
@@ -804,17 +837,28 @@ document.getElementById('cat-eye-height').addEventListener('input', function() {
   coreModule.ccall('set_cat_eye_height', null, ['number'], [parseFloat(this.value)]);
 });
 
+// ── PS1 BIOS loading ──────────────────────────────────────────
 document.getElementById('bios-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
   if (!file) return;
   const reader = new FileReader();
   reader.onload = function(ev) {
-    // BIOS must be written after the PS1 core module loads (it owns the FS).
-    // We stash the bytes and write them just before start_game instead.
     window._ps1BiosName  = file.name;
     window._ps1BiosBytes = new Uint8Array(ev.target.result);
     ps1BiosLoaded = true;
     setStatus('BIOS ready: ' + file.name + ' — now load a PS1 disc');
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+// ── GBA Save loading ─────────────────────────────────────────
+document.getElementById('gba-save-input').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    window._gbaSaveBytes = new Uint8Array(ev.target.result);
+    setStatus('GBA save loaded: ' + file.name);
   };
   reader.readAsArrayBuffer(file);
 });
@@ -836,48 +880,36 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
     return;
   }
 
-  if (PS1_EXTS.has(ext)) {
-    if (!ps1BiosLoaded) {
-      setStatus('Load a PS1 BIOS (.bin) first, then reload your disc');
-      return;
-    }
-    loadCore(bundle, function() {
-      // Write BIOS into /system/ on the now-ready FS
-      try { coreModule.FS.mkdir('/system'); } catch(e) {}
-      try { coreModule.FS.mkdir('/saves');  } catch(e) {}
-      coreModule.FS.writeFile('/system/' + window._ps1BiosName, window._ps1BiosBytes);
-
-      setStatus('Loading ' + file.name + '...');
-      const reader = new FileReader();
-      reader.onload = function(ev) {
-        const romPath = '/' + file.name;
-        coreModule.FS.writeFile(romPath, new Uint8Array(ev.target.result));
-        // For .cue discs the entry point is the .cue file itself
-        coreModule.ccall('start_game', 'void', ['string'], [romPath]);
-        startAudio();
-        setStatus('Playing: ' + file.name);
-      };
-      reader.readAsArrayBuffer(file);
-    });
+  if (PS1_EXTS.has(ext) && !ps1BiosLoaded) {
+    setStatus('Load a PS1 BIOS (.bin) first, then reload your disc');
     return;
   }
 
-  loadCore(bundle, function() {
-    setStatus('Loading ' + file.name + '...');
-    const reader = new FileReader();
-    reader.onload = ev => {
-      coreModule.FS.writeFile('/rom.bin', new Uint8Array(ev.target.result));
-      coreModule.ccall('start_game', 'void', ['string'], ['/rom.bin']);
-      startAudio();
-      setStatus('Playing: ' + file.name);
-    };
-    reader.readAsArrayBuffer(file);
-  });
+  spawnCoreWorker(bundle, file, ext);
+});
+
+// ── Eager renderer load ───────────────────────────────────────
+// Load the 3D room immediately on page open — no ROM needed.
+injectAndWait('game_renderer.js', function(mod) {
+  rendererModule = mod;
+  coreModule     = mod;   // alias — all slider/MP ccall paths work unchanged
+  frontendGL     = window.GL;
+  frontendCtx    = document.getElementById('canvas').getContext('webgl2');
+  // JS owns quad colors (no g_frame_rgba in the renderer bundle)
+  rendererModule.ccall('set_js_colors', 'void', ['number'], [1]);
+  // Apply initial slider values now that the module is live
+  applyRoomXform();
+  applyOverscan();
+  applyLampPos();
+  applyLampIntensity();
+  applyTvIntensity();
+  applyConeParams();
+  setStatus('Ready — drop a ROM to play');
 });
 </script>
 
 <!-- PeerJS for WebRTC signaling -->
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<!-- Core is loaded dynamically based on ROM file extension -->
+<!-- Renderer loads eagerly; cores load on demand as Web Workers -->
 </body>
 </html>

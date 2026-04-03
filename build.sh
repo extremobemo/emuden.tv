@@ -7,7 +7,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EXPORTS='["_main","_start_game","_set_button","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_audio_buf_ptr","_get_audio_write_pos","_get_audio_buf_size","_get_audio_sample_rate","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_set_tv_light_intensity","_set_tv_quad_colors","_set_js_colors","_set_cone_yaw","_set_cone_pitch","_set_cone_power","_get_local_moving","_set_cat_eye_height","_set_local_y"]'
+RENDERER_EXPORTS='["_main","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_upload_frame","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_set_tv_light_intensity","_set_tv_quad_colors","_set_js_colors","_set_cone_yaw","_set_cone_pitch","_set_cone_power","_get_local_moving","_set_cat_eye_height","_set_local_y"]'
+
+CORE_EXPORTS='["_main","_start_game","_set_button","_step_frame","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_audio_buf_ptr","_get_audio_write_pos","_get_audio_buf_size","_get_audio_sample_rate"]'
 
 # ── 1. Get libretro.h ─────────────────────────────────────────────────────────
 if [ ! -f include/libretro.h ]; then
@@ -60,23 +62,37 @@ if [ ! -f "$COMMON_A" ]; then
   emar rcs "$COMMON_A" $COBJS
 fi
 
-# ── 4. Link GBC bundle ────────────────────────────────────────────────────────
-echo "Linking game_gbc.js..."
+# ── 4. Link renderer bundle (main thread, loads once on page open) ────────────
+echo "Linking game_renderer.js..."
 em++ -O2 -std=c++17 \
+  -DRENDERER_ONLY \
+  -I include \
+  frontend.cpp \
+  -s FULL_ES3=1 \
+  -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
+  -s EXPORTED_FUNCTIONS="$RENDERER_EXPORTS" \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s INITIAL_MEMORY=67108864 \
+  --preload-file tv/ \
+  -o game_renderer.js
+
+# ── 5. Link GBC core bundle (Web Worker) ─────────────────────────────────────
+echo "Linking core_gbc.js..."
+em++ -O2 -std=c++17 \
+  -DCORE_ONLY \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
   frontend.cpp \
   "$COMMON_A" \
   "$GAMBATTE_A" \
-  -s FULL_ES3=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
-  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s EXPORTED_FUNCTIONS="$CORE_EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
-  --preload-file tv/ \
-  -o game_gbc.js
+  -s ENVIRONMENT=worker \
+  -o core_gbc.js
 
-# ── 5. Build snes9x core ──────────────────────────────────────────────────────
+# ── 6. Build snes9x core ──────────────────────────────────────────────────────
 SNES9X_A=cores/snes9x/snes9x_libretro.a
 
 if [ ! -f "$SNES9X_A" ]; then
@@ -98,23 +114,23 @@ fi
 [ ! -f "$SNES9X_A" ] && { echo "snes9x build failed: archive not found"; exit 1; }
 echo "snes9x: $SNES9X_A"
 
-# ── 6. Link SNES bundle ───────────────────────────────────────────────────────
-echo "Linking game_snes.js..."
+# ── 7. Link SNES core bundle (Web Worker) ────────────────────────────────────
+echo "Linking core_snes.js..."
 em++ -O2 -std=c++17 \
+  -DCORE_ONLY \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
   frontend.cpp \
   "$COMMON_A" \
   "$SNES9X_A" \
-  -s FULL_ES3=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
-  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s EXPORTED_FUNCTIONS="$CORE_EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
-  --preload-file tv/ \
-  -o game_snes.js
+  -s ENVIRONMENT=worker \
+  -o core_snes.js
 
-# ── 7. Build PCSX-ReARMed core ────────────────────────────────────────────────
+# ── 8. Build PCSX-ReARMed core ────────────────────────────────────────────────
 PCSX_A=cores/pcsx_rearmed/pcsx_rearmed_libretro.a
 
 if [ ! -f "$PCSX_A" ]; then
@@ -137,24 +153,24 @@ fi
 [ ! -f "$PCSX_A" ] && { echo "pcsx_rearmed build failed: archive not found"; exit 1; }
 echo "PCSX-ReARMed: $PCSX_A"
 
-# ── 8. Link PS1 bundle ────────────────────────────────────────────────────────
-echo "Linking game_ps1.js..."
+# ── 9. Link PS1 core bundle (Web Worker) ─────────────────────────────────────
+echo "Linking core_ps1.js..."
 em++ -O2 -std=c++17 \
+  -DCORE_ONLY \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
   frontend.cpp \
   "$COMMON_A" \
   "$PCSX_A" \
   -sUSE_ZLIB=1 \
-  -s FULL_ES3=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
-  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s EXPORTED_FUNCTIONS="$CORE_EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=268435456 \
-  --preload-file tv/ \
-  -o game_ps1.js
+  -s ENVIRONMENT=worker \
+  -o core_ps1.js
 
-# ── 9. Build mGBA core ────────────────────────────────────────────────────────
+# ── 10. Build mGBA core ───────────────────────────────────────────────────────
 MGBA_A=cores/mgba/mgba_libretro.a
 
 if [ ! -f "$MGBA_A" ]; then
@@ -177,24 +193,24 @@ fi
 [ ! -f "$MGBA_A" ] && { echo "mGBA build failed: archive not found"; exit 1; }
 echo "mGBA: $MGBA_A"
 
-# ── 10. Link GBA bundle ───────────────────────────────────────────────────────
-echo "Linking game_gba.js..."
+# ── 11. Link GBA core bundle (Web Worker) ────────────────────────────────────
+echo "Linking core_gba.js..."
 em++ -O2 -std=c++17 \
+  -DCORE_ONLY \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
   frontend.cpp \
   "$COMMON_A" \
   "$MGBA_A" \
   -sUSE_ZLIB=1 \
-  -s FULL_ES3=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
-  -s EXPORTED_FUNCTIONS="$EXPORTS" \
+  -s EXPORTED_FUNCTIONS="$CORE_EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
-  --preload-file tv/ \
-  -o game_gba.js
+  -s ENVIRONMENT=worker \
+  -o core_gba.js
 
-# ── 11. Download N64Wasm prebuilt files ───────────────────────────────────────
+# ── 12. Download N64Wasm prebuilt files ───────────────────────────────────────
 if [ ! -f n64wasm.js ]; then
   echo "Downloading N64Wasm prebuilt..."
   curl -Lo n64wasm.js \

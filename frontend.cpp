@@ -1,11 +1,24 @@
-#define CGLTF_IMPLEMENTATION
-#define STB_IMAGE_IMPLEMENTATION
-#include <emscripten.h>
-#include <emscripten/html5.h>
-#include <GLES2/gl2.h>
-#include <libretro.h>
-#include <cgltf.h>
-#include <stb_image.h>
+// ============================================================
+//  frontend.cpp
+//  Compile with -DRENDERER_ONLY for the main-thread 3D renderer
+//  Compile with -DCORE_ONLY    for a libretro core Web Worker
+// ============================================================
+
+#ifdef RENDERER_ONLY
+#  define CGLTF_IMPLEMENTATION
+#  define STB_IMAGE_IMPLEMENTATION
+#  include <emscripten.h>
+#  include <emscripten/html5.h>
+#  include <GLES2/gl2.h>
+#  include <cgltf.h>
+#  include <stb_image.h>
+#endif
+
+#ifdef CORE_ONLY
+#  include <emscripten.h>
+#  include <libretro.h>
+#endif
+
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -13,8 +26,9 @@
 #include <vector>
 
 // ============================================================
-//  Matrix math  (column-major, matches GLSL)
+//  Matrix math  (column-major, matches GLSL)  — renderer only
 // ============================================================
+#ifdef RENDERER_ONLY
 typedef float M4[16];
 
 static void m4_identity(M4 m) { memset(m,0,64); m[0]=m[5]=m[10]=m[15]=1.f; }
@@ -84,7 +98,7 @@ static void q_slerp(float* out, const float* a, const float* b, float t) {
 }
 
 // ============================================================
-//  GL state
+//  GL state  — renderer only
 // ============================================================
 struct TvPrim {
     GLuint vbo;
@@ -178,22 +192,13 @@ static int    g_skin_a_pos=-1, g_skin_a_uv=-1, g_skin_a_norm=-1;
 static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
 
 static bool g_move[4] = {};  // W S A D
+static bool g_js_colors = false; // true = JS drives quad colors (always true in new arch)
+
+// Frame dimensions — set by set_frame_size() and used by CRT shader uniforms
+static unsigned g_frame_w = 160, g_frame_h = 144;
 
 // ============================================================
-//  Audio ring buffer  (stereo int16, exposed to JS)
-// ============================================================
-static const int AUDIO_BUF = 16384 * 2;  // int16 units (16384 stereo frames)
-static int16_t   g_audio_buf[AUDIO_BUF];
-static int       g_audio_write = 0;
-static unsigned  g_audio_sample_rate = 44100;
-
-// ============================================================
-//  Frame buffer  (exposed to JS for video streaming)
-// ============================================================
-static std::vector<uint8_t> g_frame_rgba;
-
-// ============================================================
-//  CRT pass state
+//  CRT pass state  — renderer only
 // ============================================================
 static GLuint g_crt_fbo  = 0;
 static GLuint g_crt_tex  = 0;
@@ -205,18 +210,29 @@ static int    g_crt_u_out=-1, g_crt_u_texsz=-1, g_crt_u_insz=-1, g_crt_u_tex=-1;
 static const int CRT_W = 640, CRT_H = 480;
 static int    g_frame_count = 0;
 
-// ============================================================
-//  Libretro state
-// ============================================================
-static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
-static bool     g_running  = false;
-static bool     g_js_colors = false; // true = JS is driving quad colors, skip C++ sampling
-static bool     g_buttons[16] = {};
-static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_refresh
+#endif // RENDERER_ONLY
 
 // ============================================================
-//  Libretro callbacks
+//  Core globals  — core only
 // ============================================================
+#ifdef CORE_ONLY
+static const int AUDIO_BUF = 16384 * 2;  // int16 units (16384 stereo frames)
+static int16_t   g_audio_buf[AUDIO_BUF];
+static int       g_audio_write = 0;
+static unsigned  g_audio_sample_rate = 44100;
+
+static std::vector<uint8_t> g_frame_rgba;
+static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_refresh
+
+static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
+static bool     g_running  = false;
+static bool     g_buttons[16] = {};
+#endif // CORE_ONLY
+
+// ============================================================
+//  Libretro callbacks  — core only
+// ============================================================
+#ifdef CORE_ONLY
 static void retro_log_cb(retro_log_level, const char* fmt, ...) {
     va_list a; va_start(a,fmt); vprintf(fmt,a); va_end(a);
 }
@@ -253,10 +269,7 @@ void retro_video_refresh(const void* data, unsigned w, unsigned h, size_t pitch)
             }
         }
     }
-    glBindTexture(GL_TEXTURE_2D, g_game_tex);
-    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,w,h,0,GL_RGBA,GL_UNSIGNED_BYTE,g_frame_rgba.data());
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
+    // No GL calls here — frame is shipped to main thread by core_worker.js
 }
 
 void retro_audio_sample(int16_t l, int16_t r) {
@@ -292,10 +305,12 @@ bool retro_environment(unsigned cmd, void* data) {
         default: return false;
     }
 }
+#endif // CORE_ONLY
 
 // ============================================================
-//  Shaders
+//  Shaders  — renderer only
 // ============================================================
+#ifdef RENDERER_ONLY
 static const char* VS = R"(
 attribute vec3 a_pos;
 attribute vec2 a_uv;
@@ -1117,7 +1132,7 @@ static void gl_init() {
     g_u_lamp_pos      =glGetUniformLocation(g_prog,"u_lamp_pos");
     g_u_lamp_intensity=glGetUniformLocation(g_prog,"u_lamp_intensity");
 
-    // Game texture (1×1 placeholder until first frame)
+    // Game texture (1×1 dark placeholder until first frame arrives from worker)
     glGenTextures(1,&g_game_tex);
     glBindTexture(GL_TEXTURE_2D,g_game_tex);
     uint8_t dark[4]={10,10,10,255};
@@ -1149,8 +1164,6 @@ static void gl_init() {
                 g_tv_quad_pos[q][2] = g_tv_screen_pos[2] + sgn[q][0]*rz*0.5f + sgn[q][1]*uz*0.5f;
             }
             // Push lights out toward the viewer (player start position).
-            // Using TV-to-player direction is more reliable than guessing col-2
-            // orientation across different glTF exports.
             float nx = 0.f         - g_tv_screen_pos[0];
             float ny = 20.f        - g_tv_screen_pos[1]; // player eye-level
             float nz = -80.f       - g_tv_screen_pos[2]; // player start Z
@@ -1255,34 +1268,6 @@ static void update_player() {
     if (g_move[1]) { g_local.x -= fw_x*speed; g_local.z -= fw_z*speed; } // S
     if (g_move[2]) { g_local.x -= rt_x*speed; g_local.z -= rt_z*speed; } // A
     if (g_move[3]) { g_local.x += rt_x*speed; g_local.z += rt_z*speed; } // D
-}
-
-// Sample 4 screen quadrants from the raw frame buffer and average their colours.
-// These are passed to the shader as per-quadrant light colours each frame.
-static void sample_quad_colors() {
-    if (g_js_colors) return; // JS-driven mode (N64, guest stream) owns the colors
-    if (g_frame_rgba.empty() || g_frame_w == 0 || g_frame_h == 0) return;
-    int fw = (int)g_frame_w, fh = (int)g_frame_h;
-    // Quadrant pixel ranges (x0,x1,y0,y1) ordered to match g_tv_quad_pos:
-    //   q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
-    const int qx0[4] = {0,    fw/2, 0,    fw/2};
-    const int qx1[4] = {fw/2, fw,   fw/2, fw  };
-    const int qy0[4] = {fh/2, fh/2, 0,    0   };
-    const int qy1[4] = {fh,   fh,   fh/2, fh/2};
-    for (int q = 0; q < 4; q++) {
-        float r=0,g=0,b=0; int cnt=0;
-        for (int y=qy0[q]; y<qy1[q]; y+=4) {
-            for (int x=qx0[q]; x<qx1[q]; x+=4) {
-                const uint8_t* px = g_frame_rgba.data() + (y*fw+x)*4;
-                r+=px[0]; g+=px[1]; b+=px[2]; cnt++;
-            }
-        }
-        if (cnt > 0) {
-            g_tv_quad_col[q][0] = r / (cnt * 255.f);
-            g_tv_quad_col[q][1] = g / (cnt * 255.f);
-            g_tv_quad_col[q][2] = b / (cnt * 255.f);
-        }
-    }
 }
 
 static void render() {
@@ -1427,12 +1412,14 @@ static void render() {
     }
 }
 
+#endif // RENDERER_ONLY
+
 // ============================================================
-//  Input / ROM loading
+//  Exported functions
 // ============================================================
-extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int id, int pressed) {
-    if (id>=0&&id<16) g_buttons[id]=pressed;
-}
+
+// ── RENDERER_ONLY exports ────────────────────────────────────
+#ifdef RENDERER_ONLY
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_move_key(int key, int pressed) {
     // key: 0=W 1=S 2=A 3=D
@@ -1447,23 +1434,6 @@ extern "C" EMSCRIPTEN_KEEPALIVE void add_mouse_delta(float dx, float dy) {
     if (g_local.pitch < -1.48f) g_local.pitch = -1.48f;
 }
 
-extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
-    FILE* f=fopen(path,"rb");
-    if (!f) { printf("Cannot open %s\n",path); return; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
-    std::vector<uint8_t> buf(sz);
-    fread(buf.data(),1,sz,f); fclose(f);
-    retro_game_info info={}; info.path=path; info.data=buf.data(); info.size=(size_t)sz;
-    if (retro_load_game(&info)) {
-        g_running = true;
-        retro_system_av_info av = {};
-        retro_get_system_av_info(&av);
-        if (av.timing.sample_rate > 0)
-            g_audio_sample_rate = (unsigned)av.timing.sample_rate;
-        printf("ROM loaded (%ld bytes), audio %u Hz\n", sz, g_audio_sample_rate);
-    } else printf("retro_load_game failed\n");
-}
-
 extern "C" EMSCRIPTEN_KEEPALIVE int get_game_tex_id() {
     return (int)g_game_tex;
 }
@@ -1473,11 +1443,16 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_frame_size(int w, int h) {
     g_frame_h = (unsigned)h;
 }
 
-// ── Audio exports ────────────────────────────────────────────────────────────
-extern "C" EMSCRIPTEN_KEEPALIVE int16_t* get_audio_buf_ptr()    { return g_audio_buf; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_write_pos()  { return g_audio_write; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_buf_size()   { return AUDIO_BUF; }
-extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_sample_rate(){ return (int)g_audio_sample_rate; }
+// Upload a frame received from the core worker into the game texture.
+// Replaces the glTexImage2D calls that were previously inside retro_video_refresh.
+extern "C" EMSCRIPTEN_KEEPALIVE void upload_frame(const uint8_t* rgba, int w, int h) {
+    g_frame_w = (unsigned)w;
+    g_frame_h = (unsigned)h;
+    glBindTexture(GL_TEXTURE_2D, g_game_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+}
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_pos(float x, float y, float z) {
     g_lamp_pos[0]=x; g_lamp_pos[1]=y; g_lamp_pos[2]=z;
@@ -1488,8 +1463,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_lamp_intensity(float v) {
 extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_light_intensity(float v) {
     g_tv_light_intensity = v;
 }
-// Set all 4 quadrant colours at once — used by JS-driven video modes
-// (N64, guest stream) where g_frame_rgba is never populated.
+// Set all 4 quadrant colours at once — called by JS after receiving each frame from worker
 extern "C" EMSCRIPTEN_KEEPALIVE void set_tv_quad_colors(
     float r0,float g0,float b0, float r1,float g1,float b1,
     float r2,float g2,float b2, float r3,float g3,float b3) {
@@ -1528,13 +1502,6 @@ extern "C" EMSCRIPTEN_KEEPALIVE float get_tv_z() {
 
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_pitch() { return g_local.pitch; }
 
-// ── Multiplayer exports ──────────────────────────────────────────────────────
-extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_frame_ptr() {
-    return g_frame_rgba.empty() ? nullptr : g_frame_rgba.data();
-}
-extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_w() { return (int)g_frame_w; }
-extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_h() { return (int)g_frame_h; }
-
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_x()   { return g_local.x; }
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_y()   { return g_local.y; }
 extern "C" EMSCRIPTEN_KEEPALIVE float get_local_z()   { return g_local.z; }
@@ -1555,26 +1522,96 @@ extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
     if (id >= 0 && id < 8) g_remote[id].active = false;
 }
 
+#endif // RENDERER_ONLY
+
+// ── CORE_ONLY exports ────────────────────────────────────────
+#ifdef CORE_ONLY
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int id, int pressed) {
+    if (id>=0&&id<16) g_buttons[id]=pressed;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
+    FILE* f=fopen(path,"rb");
+    if (!f) { printf("Cannot open %s\n",path); return; }
+    fseek(f,0,SEEK_END); long sz=ftell(f); rewind(f);
+    std::vector<uint8_t> buf(sz);
+    fread(buf.data(),1,sz,f); fclose(f);
+    retro_game_info info={}; info.path=path; info.data=buf.data(); info.size=(size_t)sz;
+    if (retro_load_game(&info)) {
+        g_running = true;
+        retro_system_av_info av = {};
+        retro_get_system_av_info(&av);
+        if (av.timing.sample_rate > 0)
+            g_audio_sample_rate = (unsigned)av.timing.sample_rate;
+        printf("ROM loaded (%ld bytes), audio %u Hz\n", sz, g_audio_sample_rate);
+
+        // Load save RAM from /saves/<stem>.srm into the core's SRAM buffer
+        void* sram_ptr  = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+        size_t sram_size = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+        if (sram_ptr && sram_size > 0) {
+            std::string rp(path);
+            size_t sl = rp.rfind('/');
+            std::string base = (sl != std::string::npos) ? rp.substr(sl+1) : rp;
+            size_t dt = base.rfind('.');
+            std::string stem = (dt != std::string::npos) ? base.substr(0, dt) : base;
+            std::string savePath = std::string("/saves/") + stem + ".srm";
+            FILE* sf = fopen(savePath.c_str(), "rb");
+            if (sf) {
+                fseek(sf, 0, SEEK_END); long ssz = ftell(sf); rewind(sf);
+                if (ssz > 0 && (size_t)ssz <= sram_size)
+                    fread(sram_ptr, 1, ssz, sf);
+                fclose(sf);
+                printf("Save loaded: %s (%ld bytes)\n", savePath.c_str(), ssz);
+            }
+        }
+    } else printf("retro_load_game failed\n");
+}
+
+// Run one emulator frame — called by the worker's setInterval loop
+extern "C" EMSCRIPTEN_KEEPALIVE void step_frame() {
+    if (g_running) retro_run();
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* get_frame_ptr() {
+    return g_frame_rgba.empty() ? nullptr : g_frame_rgba.data();
+}
+extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_w() { return (int)g_frame_w; }
+extern "C" EMSCRIPTEN_KEEPALIVE int get_frame_h() { return (int)g_frame_h; }
+
+extern "C" EMSCRIPTEN_KEEPALIVE int16_t* get_audio_buf_ptr()    { return g_audio_buf; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_write_pos()  { return g_audio_write; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_buf_size()   { return AUDIO_BUF; }
+extern "C" EMSCRIPTEN_KEEPALIVE int      get_audio_sample_rate(){ return (int)g_audio_sample_rate; }
+
+#endif // CORE_ONLY
+
 // ============================================================
 //  Main loop + init
 // ============================================================
+#ifdef RENDERER_ONLY
 static void loop() {
     update_player();
-    if (g_running) retro_run();
-    render_crt_pass();
-    sample_quad_colors();
+    render_crt_pass();  // reads g_game_tex (uploaded by JS via receiveFrame/texImage2D)
     render();
 }
 
 int main() {
     EmscriptenWebGLContextAttributes attr;
     emscripten_webgl_init_context_attributes(&attr);
-    attr.alpha=false; attr.depth=true; attr.majorVersion=2;  // WebGL2: no NPOT restrictions
+    attr.alpha=false; attr.depth=true; attr.majorVersion=2;  // WebGL2
     auto ctx=emscripten_webgl_create_context("#canvas",&attr);
     emscripten_webgl_make_context_current(ctx);
 
     gl_init();
 
+    emscripten_set_main_loop(loop, 60, 1);
+    return 0;
+}
+#endif // RENDERER_ONLY
+
+#ifdef CORE_ONLY
+int main() {
     retro_set_environment      (retro_environment);
     retro_set_video_refresh    (retro_video_refresh);
     retro_set_audio_sample     (retro_audio_sample);
@@ -1582,7 +1619,8 @@ int main() {
     retro_set_input_poll       (retro_input_poll);
     retro_set_input_state      (retro_input_state);
     retro_init();
-
-    emscripten_set_main_loop(loop, 60, 1);
+    // Keep runtime alive so JS can call step_frame(), start_game(), etc. via ccall
+    emscripten_exit_with_live_runtime();
     return 0;
 }
+#endif // CORE_ONLY
