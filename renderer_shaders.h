@@ -114,10 +114,15 @@ uniform vec3  u_tv_normal;
 uniform float u_cone_power;
 uniform vec3  u_lamp_pos;
 uniform float u_lamp_intensity;
+uniform float u_flat_shade;   // >0.5 → bypass lighting, output albedo * u_flat_shade
 out vec4 fragColor;
 void main() {
-    vec3 n = normalize(v_wnorm);
     vec3 albedo = texture(u_tex, v_uv).rgb;
+    if (u_flat_shade > 0.5) {
+        fragColor = vec4(albedo * u_flat_shade, 1.0);
+        return;
+    }
+    vec3 n = normalize(v_wnorm);
     vec3 to_lamp  = u_lamp_pos - v_wpos;
     float ld = length(to_lamp);
     float lamp_ndotl = max(dot(n, to_lamp/ld), 0.0);

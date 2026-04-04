@@ -14,6 +14,7 @@ export const state = {
   isController:  false,  // guest-side: true when this guest has been given control
   localModel:     0,     // avatar model index (0=cat, 1=incidental_70, 2=mech), sent in position packets
   localName:      '',    // display name shown above this player's head to others
+  nowPlaying:     '',    // name of the currently loaded ROM (host sets, broadcast to viewers)
 };
 
 // Off-screen canvas used to capture game frames for WebRTC streaming.

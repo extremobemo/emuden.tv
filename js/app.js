@@ -3,7 +3,7 @@
 
 import { state } from './state.js';
 import { setStatus } from './utils.js';
-import { spawnCoreWorker, setBiosFile, setGbaSave, ps1BiosLoaded, PS1_EXTS } from './worker-bridge.js';
+import { spawnCoreWorker, setBiosFile, ps1BiosLoaded, PS1_EXTS } from './worker-bridge.js';
 import { loadN64 } from './n64.js';
 import { mpHost, mpJoin, broadcastScene } from './multiplayer.js';
 import { initInput } from './input.js';
@@ -208,16 +208,6 @@ document.getElementById('bios-input').addEventListener('change', function(e) {
   reader.readAsArrayBuffer(file);
 });
 
-document.getElementById('gba-save-input').addEventListener('change', function(e) {
-  const file = e.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = ev => {
-    setGbaSave(new Uint8Array(ev.target.result));
-    setStatus('GBA save loaded: ' + file.name);
-  };
-  reader.readAsArrayBuffer(file);
-});
 
 document.getElementById('rom-input').addEventListener('change', function(e) {
   const file = e.target.files[0];
@@ -243,9 +233,120 @@ document.getElementById('rom-input').addEventListener('change', function(e) {
   spawnCoreWorker(bundle, file, ext);
 });
 
-// ── Multiplayer button wiring ─────────────────────────────────
-document.getElementById('btn-host').addEventListener('click', mpHost);
-document.getElementById('btn-join').addEventListener('click', mpJoin);
+// ── Screen state machine ──────────────────────────────────────
+const CHAR_NAMES = ['Cat', 'Incidental 70', 'Mech'];
+let _carouselIdx   = 0;
+let _pendingIsHost = false;
+let _pendingHostId = null;
+
+
+function showScreen(name) {
+  ['landing-screen', 'carousel-screen', 'carousel-controls', 'join-prompt',
+   'ui', 'mp-bar', 'settings-btn'].forEach(function(id) {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('hidden');
+  });
+  if (name === 'landing') {
+    document.getElementById('landing-screen').classList.remove('hidden');
+  } else if (name === 'carousel') {
+    document.getElementById('carousel-screen').classList.remove('hidden');
+    document.getElementById('carousel-controls').classList.remove('hidden');
+  } else if (name === 'room') {
+    ['ui', 'mp-bar', 'settings-btn', 'overlay'].forEach(function(id) {
+      document.getElementById(id).classList.remove('hidden');
+    });
+  }
+}
+
+function updateCarouselDisplay() {
+  document.getElementById('carousel-char-name').textContent = CHAR_NAMES[_carouselIdx];
+  if (state.rendererModule)
+    state.rendererModule.ccall('set_preview_mode', null, ['number'], [_carouselIdx]);
+}
+
+function openCarousel() {
+  _carouselIdx = 0;
+  loadRenderer();
+  updateCarouselDisplay();
+  showScreen('carousel');
+  if (state.rendererModule)
+    state.rendererModule.ccall('set_preview_mode', null, ['number'], [_carouselIdx]);
+}
+
+function showJoinPrompt() {
+  document.getElementById('join-prompt').classList.remove('hidden');
+  document.getElementById('join-hostid').value = '';
+  document.getElementById('join-prompt-status').textContent = '';
+  document.getElementById('join-hostid').focus();
+}
+
+// Landing buttons
+document.getElementById('btn-landing-host').addEventListener('click', function() {
+  _pendingIsHost = true;
+  openCarousel();
+});
+document.getElementById('btn-landing-join').addEventListener('click', function() {
+  _pendingIsHost = false;
+  showJoinPrompt();
+});
+
+// Carousel arrows
+document.getElementById('carousel-prev').addEventListener('click', function() {
+  _carouselIdx = (_carouselIdx + 2) % 3;
+  updateCarouselDisplay();
+});
+document.getElementById('carousel-next').addEventListener('click', function() {
+  _carouselIdx = (_carouselIdx + 1) % 3;
+  updateCarouselDisplay();
+});
+
+// Carousel confirm
+document.getElementById('carousel-confirm').addEventListener('click', function() {
+  state.localModel = _carouselIdx;
+  state.localName  = document.getElementById('carousel-name').value.trim().slice(0, 20) || 'Player';
+  document.getElementById('player-model').value = _carouselIdx;
+  document.getElementById('local-name').value   = state.localName;
+  _previewNameplate.classList.add('hidden');
+  if (state.rendererModule)
+    state.rendererModule.ccall('exit_preview_mode', null, [], []);
+  if (_pendingIsHost) {
+    showScreen('room');
+    mpHost();
+  } else {
+    showScreen('room');
+    document.getElementById('load-rom-label').style.display = 'none';
+    setStatus('');
+    document.getElementById('mp-status').textContent = 'Room ID: ' + _pendingHostId;
+    mpJoin(_pendingHostId);
+  }
+});
+
+// Join prompt — store host ID then proceed to character select
+document.getElementById('join-confirm').addEventListener('click', function() {
+  const hostId = document.getElementById('join-hostid').value.trim();
+  if (!hostId) {
+    document.getElementById('join-prompt-status').textContent = 'Enter a peer ID first';
+    return;
+  }
+  _pendingHostId = hostId;
+  document.getElementById('join-prompt').classList.add('hidden');
+  openCarousel();
+});
+document.getElementById('join-hostid').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') document.getElementById('join-confirm').click();
+});
+
+// ── Preview nameplate ─────────────────────────────────────────
+const _previewNameplate = document.getElementById('preview-nameplate');
+document.getElementById('carousel-name').addEventListener('input', function() {
+  const name = this.value.trim();
+  if (name) {
+    _previewNameplate.textContent = name;
+    _previewNameplate.classList.remove('hidden');
+  } else {
+    _previewNameplate.classList.add('hidden');
+  }
+});
 
 // ── Scene broadcast ───────────────────────────────────────────
 // Any change to a scene control is forwarded to connected guests.
@@ -254,18 +355,31 @@ document.querySelector('.scene-section').addEventListener('input', broadcastScen
 // ── Input setup ───────────────────────────────────────────────
 initInput();
 
-// ── Eager renderer load ───────────────────────────────────────
-// Load the 3D room immediately on page open — no ROM needed.
-injectAndWait('game_renderer.js', function(mod) {
-  state.rendererModule = mod;
-  state.frontendGL     = window.GL;
-  state.frontendCtx    = document.getElementById('canvas').getContext('webgl2');
-  // Apply initial slider values now that the module is live
-  applyRoomXform();
-  applyOverscan();
-  applyLampPos();
-  applyLampIntensity();
-  applyTvIntensity();
-  applyConeParams();
-  setStatus('Ready — drop a ROM to play');
-});
+// ── Renderer load (deferred until character select) ───────────
+let _rendererLoading = false;
+function loadRenderer() {
+  if (_rendererLoading || state.rendererModule) return;
+  _rendererLoading = true;
+  injectAndWait('game_renderer.js', function(mod) {
+    state.rendererModule = mod;
+    state.frontendGL     = window.GL;
+    state.frontendCtx    = document.getElementById('canvas').getContext('webgl2');
+    applyRoomXform();
+    applyOverscan();
+    applyLampPos();
+    applyLampIntensity();
+    applyTvIntensity();
+    applyConeParams();
+    setStatus('Ready — drop a ROM to play');
+    // If carousel is already showing when renderer finishes, activate preview
+    if (!document.getElementById('carousel-controls').classList.contains('hidden'))
+      mod.ccall('set_preview_mode', null, ['number'], [_carouselIdx]);
+    // Fade in canvas now that the first frame is ready — avoids black flash on init
+    requestAnimationFrame(() => {
+      document.getElementById('canvas').style.opacity = '1';
+    });
+  });
+}
+
+// ── Initial screen ────────────────────────────────────────────
+showScreen('landing');

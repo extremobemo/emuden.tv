@@ -27,7 +27,10 @@ export function initInput() {
   const canvas  = document.getElementById('canvas');
   const overlay = document.getElementById('overlay');
 
-  canvas.addEventListener('click', () => canvas.requestPointerLock());
+  canvas.addEventListener('click', () => {
+    if (!document.getElementById('carousel-controls').classList.contains('hidden')) return;
+    canvas.requestPointerLock();
+  });
 
   document.addEventListener('pointerlockchange', () => {
     overlay.classList.add('hidden');

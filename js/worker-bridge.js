@@ -12,7 +12,6 @@ export const PS1_EXTS = new Set(['bin', 'cue', 'chd', 'img']);
 // BIOS/save state — kept module-local, sent to worker on spawn
 let _ps1BiosName  = null;
 let _ps1BiosBytes = null;
-let _gbaSaveBytes = null;
 export let ps1BiosLoaded = false;
 
 export function setBiosFile(name, bytes) {
@@ -21,9 +20,6 @@ export function setBiosFile(name, bytes) {
   ps1BiosLoaded = true;
 }
 
-export function setGbaSave(bytes) {
-  _gbaSaveBytes = bytes;
-}
 
 // Scratch canvas for frame mirroring to shareCanvas (WebRTC host streaming)
 const frameTmp = document.createElement('canvas');
@@ -114,7 +110,7 @@ function onWorkerMessage(e) {
   const msg = e.data;
   if (msg.type === 'ready') {
     startAudio(msg.sampleRate);
-    setStatus('Playing');
+    setStatus(state.nowPlaying || 'Playing');
   } else if (msg.type === 'frame') {
     receiveFrame(msg.buf, msg.w, msg.h);
   } else if (msg.type === 'audio') {
@@ -134,6 +130,7 @@ export function spawnCoreWorker(bundle, file, ext) {
     state.coreWorker.onerror = function(e) {
       setStatus('Worker error: ' + (e.message || e));
     };
+    state.nowPlaying = file.name;
     const msg = {
       type:     'load',
       bundle:   bundle,
@@ -144,9 +141,7 @@ export function spawnCoreWorker(bundle, file, ext) {
       msg.biosName  = _ps1BiosName;
       msg.biosBytes = _ps1BiosBytes.buffer.slice(0);  // copy — keep original
     }
-    if (ext === 'gba' && _gbaSaveBytes) {
-      msg.saveBytes = _gbaSaveBytes.buffer.slice(0);
-    }
+
     state.coreWorker.postMessage(msg, [msg.romBytes]);
   };
   reader.readAsArrayBuffer(file);

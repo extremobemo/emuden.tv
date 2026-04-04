@@ -185,6 +185,19 @@ struct RemotePlayer {
 };
 static RemotePlayer g_remote[8];
 
+// ── Character preview mode ────────────────────────────────────────────────────
+static bool  g_preview_active = false;
+static int   g_preview_model  = 0;
+static float g_preview_anim_t = 0.f;
+static float g_preview_spin   = 0.f;
+
+struct PreviewXform { float x, y, z, scale; };
+static PreviewXform g_preview_xform[3] = {
+    {0.f,  40.f, -25.f, 1.f},   // cat
+    {0.f,  37.f, -25.f, 1.f},   // incidental_70
+    {0.f, 150.f, -100.f, 5.f},  // mech
+};
+
 // ── Cat skinned model ────────────────────────────────────────────────────────
 struct CatChannel {
     int node, path; // path: 0=T, 1=R, 2=S
@@ -227,7 +240,7 @@ struct AnimState {
 static AnimState g_anim;
 static int    g_skin_u_vp=-1, g_skin_u_world=-1, g_skin_u_bones=-1;
 static int    g_skin_u_tex=-1, g_skin_u_tv_quad_pos=-1, g_skin_u_tv_quad_col=-1, g_skin_u_tv_normal=-1;
-static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1;
+static int    g_skin_u_lamp_pos=-1, g_skin_u_lamp_intensity=-1, g_skin_u_flat_shade=-1;
 static int    g_skin_a_pos=-1, g_skin_a_uv=-1, g_skin_a_norm=-1;
 static int    g_skin_a_joints=-1, g_skin_a_weights=-1;
 
@@ -677,6 +690,7 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
         g_skin_u_cone_power =glGetUniformLocation(g_skin_prog,"u_cone_power");
         g_skin_u_lamp_pos=glGetUniformLocation(g_skin_prog,"u_lamp_pos");
         g_skin_u_lamp_intensity=glGetUniformLocation(g_skin_prog,"u_lamp_intensity");
+        g_skin_u_flat_shade=glGetUniformLocation(g_skin_prog,"u_flat_shade");
         g_skin_a_pos    =glGetAttribLocation(g_skin_prog,"a_pos");
         g_skin_a_uv     =glGetAttribLocation(g_skin_prog,"a_uv");
         g_skin_a_norm   =glGetAttribLocation(g_skin_prog,"a_norm");
@@ -1062,6 +1076,7 @@ static void render_avatars(const M4 vp, const M4 view, const float scaled_col[4]
     glUniform1f (g_skin_u_cone_power,  g_light.cone_power);
     glUniform3fv(g_skin_u_lamp_pos, 1, g_light.lamp_pos);
     glUniform1f (g_skin_u_lamp_intensity, g_light.lamp_intensity);
+    glUniform1f (g_skin_u_flat_shade, 0.f);
 
     glDisable(GL_CULL_FACE);
 
@@ -1161,7 +1176,85 @@ static void render_avatars(const M4 vp, const M4 view, const float scaled_col[4]
     glEnable(GL_CULL_FACE);
 }
 
+static void render_preview() {
+    glViewport(0, 0, g_scene.canvas_w, g_scene.canvas_h);
+    glClearColor(0.102f, 0.102f, 0.102f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    AvatarModel* mdl = &g_models[g_preview_model];
+    if (!mdl->loaded || !mdl->vbo || mdl->anims.empty()) return;
+
+    // Advance idle animation
+    int ia = mdl->idle_anim;
+    if (ia >= 0 && ia < (int)mdl->anims.size()) {
+        float dur = mdl->anims[ia].duration;
+        if (dur > 0.f) g_preview_anim_t = fmodf(g_preview_anim_t + 1.f/60.f, dur);
+        update_anim(mdl, ia, g_preview_anim_t);
+    }
+
+    const PreviewXform& xf = g_preview_xform[g_preview_model];
+
+    // dist is scaled inversely with xf.scale so apparent model size stays consistent
+    float base_dist = (g_preview_model == 2) ? 900.f :
+                      (g_preview_model == 1) ?  40.f : 40.f;
+    float dist = base_dist / (xf.scale > 0.f ? xf.scale : 1.f);
+
+    M4 proj, view, vp;
+    float aspect = (float)g_scene.canvas_w / (float)g_scene.canvas_h;
+    m4_persp(proj, 1.6f, aspect, 0.5f, 10000.f);
+    // Camera is fixed; sliders move the model in world space (not the camera)
+    m4_lookat(view, 0.f, 0.f, dist, 0.f, 0.f, 0.f);
+    m4_mul(vp, proj, view);
+
+    // Uniform lighting: bypass NdotL entirely via u_flat_shade
+    glUseProgram(g_skin_prog);
+    glUniform1i (g_skin_u_tex, 0); glActiveTexture(GL_TEXTURE0);
+    glUniform1f (g_skin_u_flat_shade, 1.0f);
+    glUniformMatrix4fv(g_skin_u_vp, 1, GL_FALSE, vp);
+    if (mdl->joint_count > 0)
+        glUniformMatrix4fv(g_skin_u_bones, mdl->joint_count, GL_FALSE, &g_anim.bone_mats[0][0]);
+
+    // Slow spin around Y axis
+    g_preview_spin += 0.008f;
+    if (g_preview_spin > 6.2832f) g_preview_spin -= 6.2832f;
+    float ca = cosf(g_preview_spin), sa = sinf(g_preview_spin);
+
+    float sc = AVATAR_SCALE * xf.scale * (g_preview_model == 1 ? 1.75f :
+                                          g_preview_model == 2 ? 60.0f : 1.0f);
+    // Column-major: S*R_y combined — Y axis negated for model orientation
+    M4 world = {sc*ca,0,-sc*sa,0, 0,-sc,0,0, sc*sa,0,sc*ca,0, xf.x,xf.y,xf.z,1};
+    glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
+
+    glDisable(GL_CULL_FACE);
+    if(g_skin_a_pos>=0)    glEnableVertexAttribArray(g_skin_a_pos);
+    if(g_skin_a_uv>=0)     glEnableVertexAttribArray(g_skin_a_uv);
+    if(g_skin_a_norm>=0)   glEnableVertexAttribArray(g_skin_a_norm);
+    if(g_skin_a_joints>=0) glEnableVertexAttribArray(g_skin_a_joints);
+    if(g_skin_a_weights>=0)glEnableVertexAttribArray(g_skin_a_weights);
+
+    glBindBuffer(GL_ARRAY_BUFFER, mdl->vbo);
+    if(g_skin_a_pos>=0)    glVertexAttribPointer(g_skin_a_pos,    3,GL_FLOAT,GL_FALSE,64,(void*)0);
+    if(g_skin_a_uv>=0)     glVertexAttribPointer(g_skin_a_uv,     2,GL_FLOAT,GL_FALSE,64,(void*)12);
+    if(g_skin_a_norm>=0)   glVertexAttribPointer(g_skin_a_norm,   3,GL_FLOAT,GL_FALSE,64,(void*)20);
+    if(g_skin_a_joints>=0) glVertexAttribPointer(g_skin_a_joints, 4,GL_FLOAT,GL_FALSE,64,(void*)32);
+    if(g_skin_a_weights>=0)glVertexAttribPointer(g_skin_a_weights,4,GL_FLOAT,GL_FALSE,64,(void*)48);
+
+    for (const auto& am : mdl->meshes) {
+        glBindTexture(GL_TEXTURE_2D, am.tex);
+        glDrawArrays(GL_TRIANGLES, am.start, am.count);
+    }
+
+    if(g_skin_a_pos>=0)    glDisableVertexAttribArray(g_skin_a_pos);
+    if(g_skin_a_uv>=0)     glDisableVertexAttribArray(g_skin_a_uv);
+    if(g_skin_a_norm>=0)   glDisableVertexAttribArray(g_skin_a_norm);
+    if(g_skin_a_joints>=0) glDisableVertexAttribArray(g_skin_a_joints);
+    if(g_skin_a_weights>=0)glDisableVertexAttribArray(g_skin_a_weights);
+    glEnable(GL_CULL_FACE);
+}
+
 static void render() {
+    if (g_preview_active) { render_preview(); return; }
+
     glViewport(0, 0, g_scene.canvas_w, g_scene.canvas_h);
     glClearColor(0.35f,0.35f,0.35f,1.f);
     glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
@@ -1349,6 +1442,18 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_name_tex(int id, int w, i
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     g_remote[id].name_w = w;
     g_remote[id].name_h = h;
+}
+
+extern "C" EMSCRIPTEN_KEEPALIVE void set_preview_transform(int model, float x, float y, float z, float scale) {
+    if (model < 0 || model > 2) return;
+    g_preview_xform[model] = {x, y, z, scale};
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void set_preview_mode(int model_idx) {
+    if (g_preview_model != model_idx) { g_preview_model = model_idx; g_preview_anim_t = 0.f; }
+    g_preview_active = true;
+}
+extern "C" EMSCRIPTEN_KEEPALIVE void exit_preview_mode() {
+    g_preview_active = false;
 }
 
 // ============================================================

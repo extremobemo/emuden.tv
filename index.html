@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Retro TV</title>
+<title>emuden.tv</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #1a1a1a; display: flex; flex-direction: column;
          align-items: center; justify-content: center; height: 100vh; gap: 10px; }
-  canvas { display: block; cursor: crosshair; }
+  canvas { display: block; cursor: crosshair; opacity: 0; transition: opacity 0.25s ease; }
   #ui { color: #888; font: 12px monospace; text-align: center; }
   #mp-bar { color: #888; font: 12px monospace; text-align: center; margin-top: 4px; }
   #mp-bar button { background:#222; border:1px solid #444; border-radius:4px; color:#ddd;
@@ -84,6 +84,101 @@
   #settings-panel .s-title.collapsible::after { content: ' ▾'; color: #444; font-style: normal; }
   #settings-panel .s-title.collapsible.closed::after { content: ' ▸'; }
   #settings-panel .scene-section.collapsed > :not(.s-title) { display: none !important; }
+
+  /* ── Shared utility ── */
+  .hidden { display: none !important; }
+
+  /* ── Landing screen ── */
+  #landing-screen {
+    position: fixed; inset: 0; z-index: 500;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(6,6,8,0.88); gap: 18px;
+  }
+  #landing-title {
+    color: #fff; font: bold 22px monospace; letter-spacing: .12em; text-transform: uppercase;
+  }
+  #landing-btn-row { display: flex; gap: 12px; }
+  #btn-landing-host, #btn-landing-join {
+    font: bold 12px monospace; padding: 7px 24px;
+    background: #111; border: 1px solid #444; border-radius: 5px; color: #ccc;
+    cursor: pointer; letter-spacing: .06em;
+    transition: border-color .15s, color .15s;
+  }
+  #btn-landing-host:hover, #btn-landing-join:hover { border-color: #aaa; color: #fff; }
+
+  /* ── Carousel controls (below canvas, in normal flow) ── */
+  #carousel-controls {
+    display: flex; flex-direction: column; align-items: center; gap: 7px;
+    padding: 8px 0 2px;
+  }
+  #carousel-char-row { display: flex; align-items: center; gap: 16px; }
+  #carousel-prev, #carousel-next {
+    font: bold 14px monospace; padding: 4px 12px; line-height: 1;
+    background: #181818; border: 1px solid #444; border-radius: 4px;
+    color: #bbb; cursor: pointer; transition: border-color .12s, color .12s;
+  }
+  #carousel-prev:hover, #carousel-next:hover { border-color: #aaa; color: #fff; }
+  #carousel-char-name {
+    color: #fff; font: bold 13px monospace; letter-spacing: .12em;
+    min-width: 120px; text-align: center; text-transform: uppercase;
+  }
+  #carousel-name {
+    background: #181818; border: 1px solid #3a3a3a; border-radius: 4px;
+    color: #ddd; padding: 5px 10px; font: 12px monospace; width: 160px;
+    text-align: center; outline: none;
+  }
+  #carousel-name:focus { border-color: #666; }
+  #carousel-confirm {
+    font: bold 12px monospace; padding: 6px 24px; letter-spacing: .06em;
+    background: #181818; border: 1px solid #555; border-radius: 5px;
+    color: #ddd; cursor: pointer; transition: border-color .15s, color .15s;
+  }
+  #carousel-confirm:hover { border-color: #bbb; color: #fff; }
+
+  /* ── Preview nameplate ── */
+  #preview-nameplate {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    top: 30%; z-index: 610; pointer-events: none;
+    background: rgba(0,0,0,0.65); border-radius: 4px;
+    padding: 6px 18px; white-space: nowrap;
+    color: #fff; font: bold 18px sans-serif;
+  }
+
+  /* ── Join prompt ── */
+  #join-prompt {
+    position: fixed; inset: 0; z-index: 700;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(6,6,8,0.93);
+  }
+  #join-prompt-inner {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    background: #0e0e10; border: 1px solid #2a2a2a; border-radius: 8px;
+    padding: 20px 28px;
+  }
+  #join-prompt-inner > p {
+    color: #666; font: 10px monospace; letter-spacing: .1em; text-transform: uppercase;
+  }
+  #join-hostid {
+    background: #141414; border: 1px solid #444; border-radius: 4px;
+    color: #ddd; padding: 6px 10px; font: 12px monospace; width: 200px;
+    text-align: center; outline: none;
+  }
+  #join-hostid:focus { border-color: #666; }
+  #join-confirm {
+    font: bold 12px monospace; padding: 6px 22px;
+    background: #141414; border: 1px solid #555; border-radius: 5px;
+    color: #ddd; cursor: pointer; transition: border-color .12s, color .12s;
+  }
+  #join-confirm:hover { border-color: #aaa; color: #fff; }
+  #join-prompt-status { color: #555; font: 10px monospace; min-height: 14px; }
+
+  /* ── Host ID badge ── */
+  #host-id-badge {
+    color: #444; font: 11px monospace; padding: 3px 8px;
+    border: 1px solid #222; border-radius: 4px; user-select: all; cursor: text;
+    transition: color .2s;
+  }
+  #host-id-badge:hover { color: #888; }
 </style>
 </head>
 <body>
@@ -106,9 +201,33 @@
 })();
 </script>
 
+<!-- ── Landing screen ── -->
+<div id="landing-screen">
+  <h1 id="landing-title">emuden.tv</h1>
+  <div id="landing-btn-row">
+    <button id="btn-landing-host">HOST</button>
+    <button id="btn-landing-join">JOIN</button>
+  </div>
+</div>
+
+<!-- #carousel-screen: transparent overlay that activates the 3D preview mode -->
+<div id="carousel-screen" class="hidden" style="position:fixed;inset:0;z-index:600;pointer-events:none;">
+  <div id="preview-nameplate" class="hidden"></div>
+</div>
+
+<!-- ── Guest: enter host peer ID ── -->
+<div id="join-prompt" class="hidden">
+  <div id="join-prompt-inner">
+    <p>Enter host ID</p>
+    <input id="join-hostid" type="text" placeholder="Peer ID" maxlength="60" autocomplete="off">
+    <button id="join-confirm">Connect</button>
+    <span id="join-prompt-status"></span>
+  </div>
+</div>
+
 <div id="wrap">
   <canvas id="canvas"></canvas>
-  <div id="overlay">
+  <div id="overlay" class="hidden">
     <h2>Retro TV</h2>
     <p>Click to enter &nbsp;|&nbsp; ESC to release mouse</p>
     <p style="font-size:11px; color:#666">
@@ -118,23 +237,25 @@
   </div>
 </div>
 
-<div id="ui">
-  <label>Load ROM
+<div id="carousel-controls" class="hidden">
+  <div id="carousel-char-row">
+    <button id="carousel-prev">&#8592;</button>
+    <span id="carousel-char-name">Cat</span>
+    <button id="carousel-next">&#8594;</button>
+  </div>
+  <input id="carousel-name" type="text" placeholder="Enter your name" maxlength="20" autocomplete="off">
+  <button id="carousel-confirm">Confirm</button>
+</div>
+
+<div id="ui" class="hidden">
+  <label id="load-rom-label">Load ROM
     <input type="file" id="rom-input" accept=".gb,.gbc,.gba,.sfc,.smc,.fig,.swc,.bs,.z64,.n64,.v64,.chd,.cue,.bin,.img" hidden multiple>
-  </label>
-  &nbsp;
-  <label>PS1 BIOS
-    <input type="file" id="bios-input" accept=".bin" hidden>
-  </label>
-  &nbsp;
-  <label>GBA Save
-    <input type="file" id="gba-save-input" accept=".sav,.srm" hidden>
   </label>
   &nbsp; <span id="status">Loading room...</span>
 </div>
 
 <!-- ── Settings gear button ── -->
-<button id="settings-btn" onclick="document.getElementById('settings-panel').classList.toggle('open')" title="Settings">&#9881;</button>
+<button id="settings-btn" class="hidden" onclick="document.getElementById('settings-panel').classList.toggle('open')" title="Settings">&#9881;</button>
 
 <!-- ── Settings sidebar ── -->
 <div id="settings-panel">
@@ -155,7 +276,10 @@
     <div class="core-row">
       <span id="core-icon-ps1" class="core-icon">⏳</span>
       <span class="core-label">PS1</span>
-      <span id="core-note-ps1" class="core-note"></span>
+      <label class="core-note" style="cursor:pointer" title="Click to upload BIOS">
+        <span id="core-note-ps1" style="text-decoration:underline dotted"></span>
+        <input type="file" id="bios-input" accept=".bin" hidden>
+      </label>
     </div>
     <div class="core-row">
       <span id="core-icon-n64" class="core-icon">⏳</span>
@@ -272,21 +396,21 @@
   </div>
 </div>
 
-<div id="mp-bar">
-  <input id="local-name" placeholder="Your name" maxlength="20" size="10"
+<div id="mp-bar" class="hidden">
+  <input id="local-name" placeholder="Your name" maxlength="20" size="10" class="hidden"
     style="background:#222;border:1px solid #444;color:#ddd;padding:4px 8px;border-radius:4px;font:12px monospace">
-  &nbsp;
-  <button id="btn-host">Host</button>
-  &nbsp;
-  <input id="join-id" placeholder="Peer ID" size="10" style="background:#222;border:1px solid #444;color:#ddd;padding:4px 8px;border-radius:4px;font:12px monospace">
-  <button id="btn-join">Join</button>
+  <button id="btn-host" class="hidden">Host</button>
+  <input id="join-id" placeholder="Peer ID" size="10" class="hidden"
+    style="background:#222;border:1px solid #444;color:#ddd;padding:4px 8px;border-radius:4px;font:12px monospace">
+  <button id="btn-join" class="hidden">Join</button>
+  <span id="host-id-badge" class="hidden"></span>
   <span id="controller-wrap" style="display:none;color:#666;font:12px monospace">
     &nbsp; ctrl:
     <select id="controller-select" style="background:#222;border:1px solid #444;color:#ddd;padding:3px 6px;border-radius:4px;font:12px monospace">
       <option value="host">Host</option>
     </select>
   </span>
-  &nbsp; <span id="mp-status" style="color:#aaa;font:12px monospace"></span>
+  <br><span id="mp-status" style="color:#aaa;font:12px monospace;display:inline-block;margin-top:12px"></span>
 </div>
 
 <!-- PeerJS must load before the module so window.Peer is available -->

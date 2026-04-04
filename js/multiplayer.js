@@ -69,6 +69,7 @@ function getSceneState() {
     audioRolloff:    parseFloat(v('audio-rolloff').value),
     audioModel:      v('audio-model').value,
     audioCubeVisible: document.getElementById('audio-debug-cube').checked ? 1 : 0,
+    nowPlaying:      state.nowPlaying || '',
   };
 }
 
@@ -106,6 +107,10 @@ function applySceneState(s) {
   if (cubeEl) cubeEl.checked = !!s.audioCubeVisible;
   if (state.rendererModule && state.rendererModule._set_debug_cube_visible)
     state.rendererModule.ccall('set_debug_cube_visible', null, ['number'], [s.audioCubeVisible ? 1 : 0]);
+  if (s.nowPlaying !== undefined) {
+    const statusEl = document.getElementById('status');
+    if (statusEl) statusEl.textContent = s.nowPlaying || '';
+  }
 }
 
 export function broadcastScene() {
@@ -232,7 +237,9 @@ export function mpHost() {
   peerInst = new window.Peer();
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
   peerInst.on('open', function(id) {
-    mpSetStatus('Your ID: ' + id + '  (share with guest)');
+    const badge = document.getElementById('host-id-badge');
+    if (badge) { badge.textContent = id; badge.classList.remove('hidden'); }
+    mpSetStatus('Waiting for guests...');
   });
   peerInst.on('connection', function(conn) {
     mpConns.push(conn);
@@ -307,9 +314,8 @@ export function mpHost() {
   });
 }
 
-export function mpJoin() {
-  const hostId = document.getElementById('join-id').value.trim();
-  if (!hostId) { mpSetStatus('Enter a peer ID first'); return; }
+export function mpJoin(hostId) {
+  if (!hostId) return;
   state.mpIsHost = false;
   mpSetStatus('Connecting...');
   peerInst = new window.Peer();
@@ -320,7 +326,7 @@ export function mpJoin() {
     hostConn.on('open', function() {
       state.mpConnected = true;
       document.querySelector('.scene-section').style.display = 'none';
-      mpSetStatus('In room with ' + hostId);
+      mpSetStatus('Room ID: ' + hostId);
       startPositionSync(hostConn);
     });
     hostConn.on('data', function(data) {

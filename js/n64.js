@@ -102,7 +102,8 @@ export function loadN64(file) {
           try { new AudioContext().resume(); } catch(e) {}
           state.n64Module.callMain(['custom.v64']);
           state.n64Running = true;
-          setStatus('Playing: ' + file.name);
+          state.nowPlaying = file.name;
+          setStatus(file.name);
 
           // Copy n64canvas → TV texture every frame via an intermediate 2D canvas.
           // Firefox refuses texImage2D(webgl2Canvas) into a WebGL1 context, so we
