@@ -403,11 +403,37 @@ document.querySelector('.scene-section').addEventListener('input', broadcastScen
 // ── Input setup ───────────────────────────────────────────────
 initInput();
 
-// ── Renderer load (deferred until character select) ───────────
+// ── Renderer load ─────────────────────────────────────────────
+// Starts immediately on page load so the 74 MB .data file downloads in the
+// background while the user picks a character.  loadRenderer() is idempotent
+// so openCarousel() calling it again is a no-op.
 let _rendererLoading = false;
+
+function _onRendererProgress(msg) {
+  const fill  = document.getElementById('load-progress-fill');
+  const label = document.getElementById('load-progress-label');
+  if (!fill) return;
+  const m = msg.match(/\((\d+)\/(\d+)\)/);
+  if (m) {
+    const loaded = parseInt(m[1]), total = parseInt(m[2]);
+    fill.style.width = Math.round(loaded / total * 100) + '%';
+    label.textContent = Math.round(loaded / 1048576) + ' / ' + Math.round(total / 1048576) + ' MB';
+  } else if (msg === '' || msg === 'Running...') {
+    fill.style.width = '100%';
+    label.textContent = '';
+    setTimeout(function() {
+      const wrap = document.getElementById('load-progress-wrap');
+      if (wrap) wrap.style.display = 'none';
+      label.style.display = 'none';
+    }, 400);
+  }
+}
+
 function loadRenderer() {
   if (_rendererLoading || state.rendererModule) return;
   _rendererLoading = true;
+  window.Module = window.Module || {};
+  window.Module.setStatus = _onRendererProgress;
   injectAndWait('game_renderer.js', function(mod) {
     state.rendererModule = mod;
     state.frontendGL     = window.GL;
@@ -430,4 +456,5 @@ function loadRenderer() {
 }
 
 // ── Initial screen ────────────────────────────────────────────
+loadRenderer();   // start the 74 MB .data download immediately
 showScreen('landing');

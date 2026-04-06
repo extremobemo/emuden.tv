@@ -105,6 +105,15 @@
     transition: border-color .15s, color .15s;
   }
   #btn-landing-host:hover, #btn-landing-join:hover { border-color: #aaa; color: #fff; }
+  #load-progress-wrap {
+    width: 220px; height: 3px; background: #1e1e1e; border-radius: 2px; overflow: hidden;
+  }
+  #load-progress-fill {
+    height: 100%; width: 0%; background: #555; transition: width 0.15s ease;
+  }
+  #load-progress-label {
+    color: #444; font: 10px monospace; letter-spacing: .05em; min-height: 14px;
+  }
 
   /* ── Carousel controls (below canvas, in normal flow) ── */
   #carousel-controls {
@@ -211,6 +220,8 @@
 <!-- ── Landing screen ── -->
 <div id="landing-screen">
   <h1 id="landing-title">emuden.tv</h1>
+  <div id="load-progress-wrap"><div id="load-progress-fill"></div></div>
+  <div id="load-progress-label">Loading...</div>
   <div id="landing-btn-row">
     <button id="btn-landing-host">HOST</button>
     <button id="btn-landing-join">JOIN</button>
