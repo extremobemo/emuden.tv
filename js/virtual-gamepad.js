@@ -18,7 +18,10 @@ function makeVirtualPad(index) {
 
 export function setVirtualButton(padIndex, buttonIndex, pressed) {
   while (_virtualPads.length <= padIndex) _virtualPads.push(null);
-  if (!_virtualPads[padIndex]) _virtualPads[padIndex] = makeVirtualPad(padIndex);
+  if (!_virtualPads[padIndex]) {
+    _virtualPads[padIndex] = makeVirtualPad(padIndex);
+    window.dispatchEvent(new GamepadEvent('gamepadconnected', { gamepad: _virtualPads[padIndex] }));
+  }
   const btn = _virtualPads[padIndex].buttons[buttonIndex];
   if (!btn) return;
   btn.pressed = pressed;
