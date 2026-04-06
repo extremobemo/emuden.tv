@@ -111,9 +111,6 @@
   #load-progress-fill {
     height: 100%; width: 0%; background: #555; transition: width 0.15s ease;
   }
-  #load-progress-label {
-    color: #444; font: 10px monospace; letter-spacing: .05em; min-height: 14px;
-  }
 
   /* ── Carousel controls (below canvas, in normal flow) ── */
   #carousel-controls {
@@ -221,8 +218,7 @@
 <div id="landing-screen">
   <h1 id="landing-title">emuden.tv</h1>
   <div id="load-progress-wrap"><div id="load-progress-fill"></div></div>
-  <div id="load-progress-label">Loading...</div>
-  <div id="landing-btn-row">
+  <div id="landing-btn-row" class="hidden">
     <button id="btn-landing-host">HOST</button>
     <button id="btn-landing-join">JOIN</button>
   </div>

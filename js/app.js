@@ -410,21 +410,18 @@ initInput();
 let _rendererLoading = false;
 
 function _onRendererProgress(msg) {
-  const fill  = document.getElementById('load-progress-fill');
-  const label = document.getElementById('load-progress-label');
+  const fill = document.getElementById('load-progress-fill');
   if (!fill) return;
   const m = msg.match(/\((\d+)\/(\d+)\)/);
   if (m) {
     const loaded = parseInt(m[1]), total = parseInt(m[2]);
     fill.style.width = Math.round(loaded / total * 100) + '%';
-    label.textContent = Math.round(loaded / 1048576) + ' / ' + Math.round(total / 1048576) + ' MB';
   } else if (msg === '' || msg === 'Running...') {
     fill.style.width = '100%';
-    label.textContent = '';
     setTimeout(function() {
       const wrap = document.getElementById('load-progress-wrap');
       if (wrap) wrap.style.display = 'none';
-      label.style.display = 'none';
+      document.getElementById('landing-btn-row').classList.remove('hidden');
     }, 400);
   }
 }
