@@ -85,7 +85,7 @@ in vec4 a_joints;
 in vec4 a_weights;
 uniform mat4 u_vp;
 uniform mat4 u_world;
-uniform mat4 u_bones[29];
+uniform mat4 u_bones[48];
 out vec2 v_uv;
 out vec3 v_wpos;
 out vec3 v_wnorm;

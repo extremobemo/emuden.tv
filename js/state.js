@@ -10,7 +10,7 @@ export const state = {
   n64Module:      null,  // N64Wasm module handle
   mpIsHost:       false, // true when this client is hosting a multiplayer session
   mpConnected:    false, // true when this client is connected as a guest
-  localModel:     0,     // avatar model index (0=cat, 1=incidental_70, 2=mech), sent in position packets
+  localModel:     0,     // avatar model index (0=cat, 1=incidental_70, 2=mech, 3=knight), sent in position packets
   localName:      '',    // display name shown above this player's head to others
   nowPlaying:     '',    // name of the currently loaded ROM (host sets, broadcast to viewers)
 };

@@ -38,6 +38,78 @@
   }
   #settings-btn:hover { background: #333; color: #ddd; }
 
+  /* ── Controls (key bindings) button ── */
+  #controls-btn {
+    position: fixed; top: 14px; right: 58px; z-index: 1000;
+    background: #222; border: 1px solid #444; border-radius: 6px;
+    color: #bbb; font-size: 16px; width: 36px; height: 36px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  #controls-btn:hover { background: #333; color: #ddd; }
+
+  /* ── Controls modal ── */
+  #controls-panel {
+    position: fixed; inset: 0; z-index: 1100;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.7);
+  }
+  #controls-inner {
+    background: #1c1c1c; border: 1px solid #2e2e2e; border-radius: 8px;
+    padding: 18px 22px; width: 280px;
+  }
+  .cp-header {
+    display: flex; align-items: center; margin-bottom: 14px;
+  }
+  .cp-title {
+    color: #555; font: 10px monospace; text-transform: uppercase;
+    letter-spacing: .1em; flex: 1;
+  }
+  #controls-reset {
+    background: #222; border: 1px solid #3a3a3a; border-radius: 4px;
+    color: #666; font: 10px monospace; padding: 3px 8px; cursor: pointer;
+    margin-right: 8px;
+  }
+  #controls-reset:hover { color: #bbb; border-color: #666; }
+  #controls-close {
+    background: none; border: none; color: #555; cursor: pointer;
+    font-size: 14px; padding: 0 2px; line-height: 1;
+  }
+  #controls-close:hover { color: #ccc; }
+  .cp-ipicker { margin-bottom: 12px; display: flex; flex-direction: column; gap: 5px; }
+  .cp-ipicker-row { display: flex; gap: 6px; }
+  .cp-ipicker select {
+    flex: 1; background: #252525; border: 1px solid #383838; color: #ccc;
+    font: 11px monospace; border-radius: 4px; padding: 4px 7px;
+  }
+  #cp-refresh {
+    background: #222; border: 1px solid #3a3a3a; border-radius: 4px;
+    color: #666; font: 13px monospace; padding: 2px 8px; cursor: pointer; line-height: 1.4;
+    flex-shrink: 0;
+  }
+  #cp-refresh:hover { color: #bbb; border-color: #666; }
+  .cp-row {
+    display: grid; grid-template-columns: 1fr 96px; gap: 8px;
+    align-items: center; padding: 5px 0; border-bottom: 1px solid #242424;
+  }
+  .cp-row:last-child { border-bottom: none; }
+  .cp-label { color: #999; font: 11px monospace; }
+  .cp-key {
+    background: #252525; border: 1px solid #383838; border-radius: 4px;
+    color: #ccc; font: 11px monospace; padding: 3px 8px; cursor: pointer;
+    min-width: 72px; text-align: center; transition: border-color .12s;
+    user-select: none;
+  }
+  .cp-key:hover { border-color: #666; color: #fff; }
+  .cp-key.listening {
+    border-color: #888; color: #fff; background: #2e2e2e;
+    animation: cp-pulse 0.7s ease-in-out infinite;
+  }
+  @keyframes cp-pulse {
+    0%, 100% { border-color: #888; }
+    50%       { border-color: #eee; }
+  }
+
   /* ── Settings sidebar ── */
   #settings-panel {
     position: fixed; top: 0; right: -320px; width: 300px; height: 100vh;
@@ -281,6 +353,31 @@
 
 <!-- ── Settings gear button ── -->
 <button id="settings-btn" class="hidden" onclick="document.getElementById('settings-panel').classList.toggle('open')" title="Settings">&#9881;</button>
+
+<!-- ── Key bindings button ── -->
+<button id="controls-btn" class="hidden" title="Key Bindings">&#127918;</button>
+
+<!-- ── Key bindings modal ── -->
+<div id="controls-panel" class="hidden">
+  <div id="controls-inner">
+    <div class="cp-header">
+      <span class="cp-title">Controls</span>
+      <button id="controls-reset">Reset</button>
+      <button id="controls-close">&#x2715;</button>
+    </div>
+    <div class="cp-ipicker">
+      <select id="cp-system-select">
+        <option value="libretro">Libretro (GBC / GBA / SNES / PS1)</option>
+        <option value="n64">N64</option>
+      </select>
+      <div class="cp-ipicker-row">
+        <select id="cp-input-select"><option value="keyboard">Keyboard</option></select>
+        <button id="cp-refresh" title="Refresh controllers">&#8635;</button>
+      </div>
+    </div>
+    <div id="controls-rows"></div>
+  </div>
+</div>
 
 <!-- ── Settings sidebar ── -->
 <div id="settings-panel">

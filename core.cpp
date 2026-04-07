@@ -31,6 +31,7 @@ static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_ref
 static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static bool     g_running  = false;
 static bool     g_buttons[4][16] = {};  // [port][button], up to 4 simultaneous players
+static int16_t  g_analog[4][2][2] = {}; // [port][stick][axis] — stick 0=left,1=right; axis 0=X,1=Y
 
 // ============================================================
 //  Libretro callbacks
@@ -88,9 +89,17 @@ size_t retro_audio_sample_batch(const int16_t* data, size_t frames) {
     return frames;
 }
 void   retro_input_poll() {}
-int16_t retro_input_state(unsigned port,unsigned device,unsigned,unsigned id) {
-    if (port>=4||device!=RETRO_DEVICE_JOYPAD||id>=16) return 0;
-    return g_buttons[port][id]?1:0;
+int16_t retro_input_state(unsigned port,unsigned device,unsigned idx,unsigned id) {
+    if (port>=4) return 0;
+    if (device==RETRO_DEVICE_JOYPAD) {
+        if (id>=16) return 0;
+        return g_buttons[port][id]?1:0;
+    }
+    if (device==RETRO_DEVICE_ANALOG) {
+        if (idx>1||id>1) return 0;
+        return g_analog[port][idx][id];
+    }
+    return 0;
 }
 bool retro_environment(unsigned cmd, void* data) {
     switch(cmd) {
@@ -116,6 +125,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int port, int id, int pressed) {
     if (port>=0&&port<4&&id>=0&&id<16) g_buttons[port][id]=pressed;
 }
 
+extern "C" EMSCRIPTEN_KEEPALIVE void set_analog(int port, int stick, int axis, int value) {
+    if (port>=0&&port<4&&stick>=0&&stick<2&&axis>=0&&axis<2)
+        g_analog[port][stick][axis] = (int16_t)value;
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
     // retro_init is called here (not in main) so that BIOS/system files written
     // by core_worker.js onReady are already in the FS before the core initialises.
@@ -128,6 +142,8 @@ extern "C" EMSCRIPTEN_KEEPALIVE void start_game(const char* path) {
     retro_game_info info={}; info.path=path; info.data=buf.data(); info.size=(size_t)sz;
     if (retro_load_game(&info)) {
         g_running = true;
+        retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+        retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
         retro_system_av_info av = {};
         retro_get_system_av_info(&av);
         if (av.timing.sample_rate > 0)

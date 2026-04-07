@@ -20,6 +20,7 @@ import { state, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
 import { initN64VirtualPads } from './virtual-gamepad.js';
+import { buildN64Config, N64_PAD, N64_KB } from './n64-bindings.js';
 
 // Wrap n64wasm.js in an IIFE before injecting.
 // n64wasm.js (Emscripten 2.0.7) uses var/function declarations that conflict with
@@ -57,6 +58,62 @@ function loadN64Wasm(callback) {
     .catch(function() { setStatus('Failed to fetch n64wasm.js'); });
 }
 
+// Translates a N64Wasm key string (e.g. 'i', 'Enter', 'Up') back to
+// KeyboardEvent init properties so synthetic events reach Emscripten/SDL.
+function _n64KeyToProps(n64key) {
+  const named = {
+    Up: { key: 'ArrowUp',    code: 'ArrowUp'    },
+    Down: { key: 'ArrowDown',  code: 'ArrowDown'  },
+    Left: { key: 'ArrowLeft',  code: 'ArrowLeft'  },
+    Right: { key: 'ArrowRight', code: 'ArrowRight' },
+    Enter:  { key: 'Enter',   code: 'Enter'       },
+    Space:  { key: ' ',       code: 'Space'       },
+    LShift: { key: 'Shift',   code: 'ShiftLeft'   },
+    RShift: { key: 'Shift',   code: 'ShiftRight'  },
+    LCtrl:  { key: 'Control', code: 'ControlLeft' },
+    RCtrl:  { key: 'Control', code: 'ControlRight'},
+  };
+  if (named[n64key]) return named[n64key];
+  if (n64key.length === 1) return { key: n64key, code: 'Key' + n64key.toUpperCase() };
+  return { key: n64key, code: n64key };
+}
+
+// Polls right-stick axes each frame and dispatches keyboard events when an
+// axis-bound C-button crosses the threshold.  This runs for the lifetime of
+// the N64 session; axis bindings are stored as "axis:N:D" strings in N64_PAD.
+function _startN64AxisPoll() {
+  const THRESHOLD  = 0.5;
+  const C_ACTIONS  = ['CUp', 'CDown', 'CLeft', 'CRight'];
+  const _prev = {};
+
+  (function poll() {
+    if (!state.n64Running) return;
+    const gps = navigator.getGamepads ? navigator.getGamepads() : [];
+    const gp  = [...gps].find(g => g && g.connected && !g.id.startsWith('Virtual'));
+    if (gp) {
+      for (const action of C_ACTIONS) {
+        const binding = N64_PAD[action];
+        if (typeof binding !== 'string' || !binding.startsWith('axis:')) continue;
+        const [, aStr, dStr] = binding.split(':');
+        const val     = gp.axes[+aStr] || 0;
+        const pressed = +dStr > 0 ? val > THRESHOLD : val < -THRESHOLD;
+        if (pressed !== !!_prev[action]) {
+          _prev[action] = pressed;
+          const kbKey = N64_KB[action];
+          if (kbKey) {
+            const props = _n64KeyToProps(kbKey);
+            document.dispatchEvent(new KeyboardEvent(
+              pressed ? 'keydown' : 'keyup',
+              { ...props, bubbles: true, cancelable: true }
+            ));
+          }
+        }
+      }
+    }
+    requestAnimationFrame(poll);
+  })();
+}
+
 export function loadN64(file) {
   if (state.n64Running) {
     if (!confirm('Loading another N64 ROM requires a page reload. Continue?')) return;
@@ -87,16 +144,7 @@ export function loadN64(file) {
           const fs = state.n64Module.FS;
           fs.writeFile('assets.zip', new Uint8Array(assetsBuf));
 
-          const cfg = [
-            '12','13','14','15','0','2','9','4','6','5','11','-1','-1','-1','-1',
-            'b','n','y','h','Enter','i','k','j','l','a','q','e','s','d','`',
-            'Up','Down','Left','Right',
-            '0','0','0',   // save files
-            '0','0','1',   // fps, swap sticks, disable audio sync
-            '0','0','0',   // invert Y axis 2/3/4P
-            '0','0','0','0',
-          ].join('\r\n') + '\r\n';
-          fs.writeFile('config.txt', cfg);
+          fs.writeFile('config.txt', buildN64Config());
           fs.writeFile('cheat.txt', '');
           fs.writeFile('custom.v64', romBytes);
 
@@ -106,6 +154,17 @@ export function loadN64(file) {
           initN64VirtualPads();
           state.n64Module.callMain(['custom.v64']);
           state.n64Running = true;
+          _startN64AxisPoll();
+          // SDL2 opens joystick handles via 'gamepadconnected' events, not just
+          // by reading navigator.getGamepads(). Dispatch them after callMain so
+          // SDL's joystick subsystem is fully initialized before we announce the
+          // virtual pads — otherwise axis polling won't flow through for P2.
+          setTimeout(function() {
+            [0, 1].forEach(function(i) {
+              const pad = navigator.getGamepads()[i];
+              if (pad) window.dispatchEvent(new GamepadEvent('gamepadconnected', { gamepad: pad }));
+            });
+          }, 500);
           state.nowPlaying = file.name;
           setStatus(file.name);
 

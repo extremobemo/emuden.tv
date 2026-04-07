@@ -33,6 +33,8 @@ self.onmessage = function(e) {
     loadCore(msg);
   } else if (msg.type === 'button') {
     if (coreM) coreM._set_button(msg.port || 0, msg.id, msg.pressed ? 1 : 0);
+  } else if (msg.type === 'axis') {
+    if (coreM) coreM._set_analog(msg.port || 0, msg.stick, msg.axis, msg.value);
   } else if (msg.type === 'terminate') {
     if (frameInterval) { clearInterval(frameInterval); frameInterval = null; }
   }

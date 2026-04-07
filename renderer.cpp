@@ -192,10 +192,11 @@ static float g_preview_anim_t = 0.f;
 static float g_preview_spin   = 0.f;
 
 struct PreviewXform { float x, y, z, scale; };
-static PreviewXform g_preview_xform[3] = {
+static PreviewXform g_preview_xform[4] = {
     {0.f,  40.f, -25.f, 1.f},   // cat
     {0.f,  37.f, -25.f, 1.f},   // incidental_70
     {0.f, 150.f, -100.f, 5.f},  // mech
+    {0.f,  40.f, -25.f, 1.f},   // knight
 };
 
 // ── Cat skinned model ────────────────────────────────────────────────────────
@@ -207,7 +208,7 @@ struct CatAnim {
     float duration;
     std::vector<CatChannel> channels;
 };
-static const int CAT_JOINTS = 29;
+static const int CAT_JOINTS = 48;
 static const int CAT_NODES  = 64; // large enough for all supported models
 struct AvatarMesh { int start, count; GLuint tex; };
 struct AvatarModel {
@@ -226,7 +227,7 @@ struct AvatarModel {
     int walk_anim = 0;
     bool loaded = false;
 };
-static AvatarModel g_models[3]; // 0=cat, 1=incidental_70, 2=mech
+static AvatarModel g_models[4]; // 0=cat, 1=incidental_70, 2=mech, 3=knight
 static GLuint g_skin_prog  = 0;
 
 // Scratch buffers for animation evaluation — overwritten each frame per active player
@@ -558,20 +559,40 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
         else { dest->node_def_s[ni][0]=1; dest->node_def_s[ni][1]=1; dest->node_def_s[ni][2]=1; }
     }
 
-    // ── Skin ─────────────────────────────────────────────────────────────────
-    cgltf_skin* skin = &gltf->skins[0];
-    dest->joint_count = (int)skin->joints_count;
-    if (dest->joint_count > CAT_JOINTS) dest->joint_count = CAT_JOINTS;
-    for (int j = 0; j < dest->joint_count; j++)
-        dest->joint_nodes[j] = (int)(skin->joints[j] - gltf->nodes);
-    if (skin->inverse_bind_matrices) {
-        for (int j = 0; j < dest->joint_count; j++)
-            cgltf_accessor_read_float(skin->inverse_bind_matrices, j, dest->inv_bind[j], 16);
-    } else {
-        for (int j = 0; j < dest->joint_count; j++) { m4_identity(dest->inv_bind[j]); }
+    // ── Skins (build unified joint list across all skins) ──────────────────
+    int node_to_joint[CAT_NODES];
+    for (int i = 0; i < CAT_NODES; i++) node_to_joint[i] = -1;
+    dest->joint_count = 0;
+
+    // Map each mesh index to its skin index (via the node that references it)
+    int mesh_skin[64];
+    memset(mesh_skin, -1, sizeof(mesh_skin));
+    for (cgltf_size ni = 0; ni < gltf->nodes_count; ni++) {
+        cgltf_node* n = &gltf->nodes[ni];
+        if (n->mesh && n->skin) {
+            int mi = (int)(n->mesh - gltf->meshes);
+            if (mi >= 0 && mi < 64) mesh_skin[mi] = (int)(n->skin - gltf->skins);
+        }
     }
 
-    // ── Mesh VBO (all meshes concatenated) + per-mesh textures ───────────────
+    for (cgltf_size si = 0; si < gltf->skins_count; si++) {
+        cgltf_skin* sk = &gltf->skins[si];
+        for (cgltf_size j = 0; j < sk->joints_count; j++) {
+            int ni = (int)(sk->joints[j] - gltf->nodes);
+            if (ni < 0 || ni >= CAT_NODES) continue;
+            if (node_to_joint[ni] >= 0) continue; // already in unified list
+            if (dest->joint_count >= CAT_JOINTS) break;
+            node_to_joint[ni] = dest->joint_count;
+            dest->joint_nodes[dest->joint_count] = ni;
+            if (sk->inverse_bind_matrices)
+                cgltf_accessor_read_float(sk->inverse_bind_matrices, j, dest->inv_bind[dest->joint_count], 16);
+            else
+                m4_identity(dest->inv_bind[dest->joint_count]);
+            dest->joint_count++;
+        }
+    }
+
+    // ── Mesh VBO (skinned meshes concatenated) + per-mesh textures ───────────
     char base_dir[256] = {};
     const char* last_slash = strrchr(gltf_path, '/');
     if (last_slash) {
@@ -591,6 +612,12 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
             if (at.type==cgltf_attribute_type_joints  && at.index==0)         joints_acc=at.data;
             if (at.type==cgltf_attribute_type_weights && at.index==0)         weights_acc=at.data;
         }
+        // Skip unskinned meshes (e.g. shadow planes with no joint/weight data)
+        if (!joints_acc || !weights_acc) continue;
+
+        int si_mesh = ((int)mi < 64) ? mesh_skin[(int)mi] : -1;
+        cgltf_skin* sk = (si_mesh >= 0 && si_mesh < (int)gltf->skins_count) ? &gltf->skins[si_mesh] : nullptr;
+
         int icount = (int)prim->indices->count;
         int vstart = (int)(vdata.size() / 16);
         vdata.resize(vdata.size() + icount * 16);
@@ -600,9 +627,18 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
             if (pos_acc)     cgltf_accessor_read_float(pos_acc,    idx, dst+0,  3); else {dst[0]=dst[1]=dst[2]=0;}
             if (uv_acc)      cgltf_accessor_read_float(uv_acc,     idx, dst+3,  2); else {dst[3]=dst[4]=0;}
             if (norm_acc)    cgltf_accessor_read_float(norm_acc,   idx, dst+5,  3); else {dst[5]=0;dst[6]=1;dst[7]=0;}
-            if (joints_acc)  { unsigned ji[4]={0,0,0,0}; cgltf_accessor_read_uint(joints_acc, idx, ji, 4);
-                               dst[8]=(float)ji[0];dst[9]=(float)ji[1];dst[10]=(float)ji[2];dst[11]=(float)ji[3]; }
-            if (weights_acc) cgltf_accessor_read_float(weights_acc, idx, dst+12, 4);
+            { unsigned ji[4]={0,0,0,0}; cgltf_accessor_read_uint(joints_acc, idx, ji, 4);
+              if (sk) {
+                  for (int k = 0; k < 4; k++) {
+                      if (ji[k] < sk->joints_count) {
+                          int nidx = (int)(sk->joints[ji[k]] - gltf->nodes);
+                          ji[k] = (nidx >= 0 && nidx < CAT_NODES && node_to_joint[nidx] >= 0)
+                                  ? (unsigned)node_to_joint[nidx] : 0;
+                      } else ji[k] = 0;
+                  }
+              }
+              dst[8]=(float)ji[0];dst[9]=(float)ji[1];dst[10]=(float)ji[2];dst[11]=(float)ji[3]; }
+            cgltf_accessor_read_float(weights_acc, idx, dst+12, 4);
         }
         GLuint tex = 0;
         if (prim->material) {
@@ -641,11 +677,17 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
         if (icontains(name, "idle")) dest->idle_anim = (int)ai;
         if (icontains(name, "walk")) dest->walk_anim = (int)ai;
         CatAnim anim; anim.duration = 0.f;
+        // Find min/max time across all samplers (Sketchfab exports may not start at 0)
+        float anim_min_t = 1e30f;
         for (cgltf_size si = 0; si < ca->samplers_count; si++) {
-            float last = 0.f;
+            float first = 0.f, last = 0.f;
+            cgltf_accessor_read_float(ca->samplers[si].input, 0, &first, 1);
             cgltf_accessor_read_float(ca->samplers[si].input, ca->samplers[si].input->count-1, &last, 1);
+            if (first < anim_min_t) anim_min_t = first;
             if (last > anim.duration) anim.duration = last;
         }
+        if (anim_min_t < 0.f) anim_min_t = 0.f;
+        anim.duration -= anim_min_t; // use span, not absolute max
         for (cgltf_size ci = 0; ci < ca->channels_count; ci++) {
             cgltf_animation_channel* ch = &ca->channels[ci];
             int path = -1;
@@ -658,7 +700,10 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
             chan.path = path;
             cgltf_accessor* inp = ch->sampler->input;
             chan.times.resize(inp->count);
-            for (cgltf_size k=0;k<inp->count;k++) cgltf_accessor_read_float(inp,k,&chan.times[k],1);
+            for (cgltf_size k=0;k<inp->count;k++) {
+                cgltf_accessor_read_float(inp,k,&chan.times[k],1);
+                chan.times[k] -= anim_min_t; // normalize to start at 0
+            }
             cgltf_accessor* out = ch->sampler->output;
             int comp = (path==1)?4:3;
             chan.values.resize(out->count*comp);
@@ -705,6 +750,7 @@ static void load_avatar(AvatarModel* dest, const char* gltf_path) {
 static void load_cat()        { load_avatar(&g_models[0], "/tv/cat/scene.gltf"); }
 static void load_incidental() { load_avatar(&g_models[1], "/tv/incidental_70/scene.gltf"); }
 static void load_mech()       { load_avatar(&g_models[2], "/tv/Mech.glb"); }
+static void load_knight()     { load_avatar(&g_models[3], "/tv/knight/scene.gltf"); }
 
 // ============================================================
 //  GL init
@@ -921,6 +967,7 @@ static void gl_init() {
     load_cat();
     load_incidental();
     load_mech();
+    load_knight();
     // Cache canvas pixel dimensions — the JS side locks canvas size after init,
     // so this is called once here rather than inside every render() frame.
     emscripten_get_canvas_element_size("#canvas", &g_scene.canvas_w, &g_scene.canvas_h);
@@ -1109,7 +1156,8 @@ static void render_avatars(const M4 vp, const M4 view, const float scaled_col[4]
 
         float c=cosf(g_remote[i].yaw), s=sinf(g_remote[i].yaw);
         float sc = AVATAR_SCALE * (g_remote[i].model_idx == 1 ? 1.75f :
-                                   g_remote[i].model_idx == 2 ? 60.0f : 1.0f);
+                                   g_remote[i].model_idx == 2 ? 60.0f :
+                                   g_remote[i].model_idx == 3 ? 1.0f  : 1.0f);
         M4 world;
         world[0]=c*sc; world[1]=0.f;  world[2]=-s*sc; world[3]=0.f;
         world[4]=0.f;  world[5]=-sc;  world[6]=0.f;   world[7]=0.f;
@@ -1220,7 +1268,8 @@ static void render_preview() {
     float ca = cosf(g_preview_spin), sa = sinf(g_preview_spin);
 
     float sc = AVATAR_SCALE * xf.scale * (g_preview_model == 1 ? 1.75f :
-                                          g_preview_model == 2 ? 60.0f : 1.0f);
+                                          g_preview_model == 2 ? 60.0f :
+                                          g_preview_model == 3 ? 1.0f  : 1.0f);
     // Column-major: S*R_y combined — Y axis negated for model orientation
     M4 world = {sc*ca,0,-sc*sa,0, 0,-sc,0,0, sc*sa,0,sc*ca,0, xf.x,xf.y,xf.z,1};
     glUniformMatrix4fv(g_skin_u_world, 1, GL_FALSE, world);
@@ -1419,7 +1468,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void remove_remote_player(int id) {
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_model(int id, int model) {
     if (id < 0 || id >= 8) return;
-    int mdl = (model >= 0 && model < 3) ? model : 0;
+    int mdl = (model >= 0 && model < 4) ? model : 0;
     if (g_remote[id].model_idx != mdl) {
         g_remote[id].model_idx = mdl;
         g_remote[id].anim_idx  = g_models[mdl].idle_anim;
@@ -1445,7 +1494,7 @@ extern "C" EMSCRIPTEN_KEEPALIVE void set_remote_player_name_tex(int id, int w, i
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_preview_transform(int model, float x, float y, float z, float scale) {
-    if (model < 0 || model > 2) return;
+    if (model < 0 || model > 3) return;
     g_preview_xform[model] = {x, y, z, scale};
 }
 extern "C" EMSCRIPTEN_KEEPALIVE void set_preview_mode(int model_idx) {
