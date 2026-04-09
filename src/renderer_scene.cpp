@@ -88,10 +88,10 @@ void load_tv() {
 void load_room() {
     cgltf_options opts = {};
     cgltf_data* gltf = nullptr;
-    cgltf_result r = cgltf_parse_file(&opts, "/tv/crt_room_full.gltf", &gltf);
-    if (r != cgltf_result_success) { printf("crt_room_full.gltf parse failed: %d\n",r); return; }
-    r = cgltf_load_buffers(&opts, gltf, "/tv/crt_room_full.gltf");
-    if (r != cgltf_result_success) { printf("room.gltf load_buffers failed: %d\n",r); return; }
+    cgltf_result r = cgltf_parse_file(&opts, "/tv/crt_room_full.glb", &gltf);
+    if (r != cgltf_result_success) { printf("crt_room_full.glb parse failed: %d\n",r); return; }
+    r = cgltf_load_buffers(&opts, gltf, "/tv/crt_room_full.glb");
+    if (r != cgltf_result_success) { printf("crt_room_full.glb load_buffers failed: %d\n",r); return; }
 
     std::vector<GLuint> tex_cache(gltf->images_count, 0);
     auto get_tex = [&](cgltf_image* img) -> GLuint {
