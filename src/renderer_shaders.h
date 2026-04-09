@@ -1,11 +1,11 @@
 // renderer_shaders.h
 // GLSL shader source strings for the 3D room renderer.
-// Included once by renderer.cpp — not a standalone translation unit.
+// Included by multiple .cpp files — uses inline (C++17) to avoid ODR violations.
 
 // ============================================================
 //  Static geometry shaders (GLSL ES 1.0 / WebGL 1 compatible)
 // ============================================================
-static const char* VS = R"(
+inline const char* VS = R"(
 attribute vec3 a_pos;
 attribute vec2 a_uv;
 attribute vec3 a_norm;
@@ -23,7 +23,7 @@ void main() {
 }
 )";
 
-static const char* FS = R"(
+inline const char* FS = R"(
 precision mediump float;
 varying vec2 v_uv;
 varying vec3 v_wpos;
@@ -77,7 +77,7 @@ void main() {
 // ============================================================
 //  Skinned-mesh shaders (GLSL ES 3.00 / WebGL2)
 // ============================================================
-static const char* SKIN_VS = R"(#version 300 es
+inline const char* SKIN_VS = R"(#version 300 es
 in vec3 a_pos;
 in vec2 a_uv;
 in vec3 a_norm;
@@ -102,7 +102,7 @@ void main() {
 }
 )";
 
-static const char* SKIN_FS = R"(#version 300 es
+inline const char* SKIN_FS = R"(#version 300 es
 precision mediump float;
 in vec2  v_uv;
 in vec3  v_wpos;
@@ -147,7 +147,7 @@ void main() {
 //  CRT-Geom shaders (adapted for GLSL ES 1.0)
 //  Original: Copyright (C) 2010-2012 cgwg, Themaister and DOLLS (GPL v2+)
 // ============================================================
-static const char* CRT_VS = R"(
+inline const char* CRT_VS = R"(
 #define CRTgamma 2.4
 #define d 1.6
 #define R 2.0
@@ -223,7 +223,7 @@ void main() {
 }
 )";
 
-static const char* CRT_FS = R"(
+inline const char* CRT_FS = R"(
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
 #else
@@ -357,13 +357,13 @@ void main() {
 // ============================================================
 //  Flat-color shader — used for debug wireframe overlays
 // ============================================================
-static const char* VS_FLAT = R"(
+inline const char* VS_FLAT = R"(
 attribute vec3 a_pos;
 uniform mat4 u_mvp;
 void main() { gl_Position = u_mvp * vec4(a_pos, 1.0); }
 )";
 
-static const char* FS_FLAT = R"(
+inline const char* FS_FLAT = R"(
 precision mediump float;
 uniform vec3 u_color;
 void main() { gl_FragColor = vec4(u_color, 1.0); }
@@ -372,7 +372,7 @@ void main() { gl_FragColor = vec4(u_color, 1.0); }
 // ============================================================
 //  Billboard shader — textured quad always facing the camera
 // ============================================================
-static const char* VS_BILL = R"(
+inline const char* VS_BILL = R"(
 attribute vec2 a_corner;
 uniform vec3  u_center;
 uniform vec3  u_cam_right;
@@ -390,7 +390,7 @@ void main() {
 }
 )";
 
-static const char* FS_BILL = R"(
+inline const char* FS_BILL = R"(
 precision mediump float;
 varying vec2 v_uv;
 uniform sampler2D u_tex;

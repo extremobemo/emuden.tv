@@ -1,12 +1,9 @@
-# Cores — cloned at build time by build.sh (not needed for deployment)
-
+# Cores — cloned at build time by build.sh
+cores/
 
 # Emscripten generated
 *.mem
 *.symbols
-
-# Cores — cloned at build time by build.sh
-cores/
 
 # Object files
 *.o

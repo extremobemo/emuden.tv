@@ -18,20 +18,27 @@
 #include <algorithm>
 
 // ============================================================
+//  Constants
+// ============================================================
+static constexpr int AUDIO_BUF          = 16384 * 2;  // int16 units (16384 stereo frames)
+static constexpr int MAX_PORTS          = 4;
+static constexpr int MAX_BUTTONS        = 16;
+static constexpr unsigned DEFAULT_SAMPLE_RATE = 44100;
+
+// ============================================================
 //  State
 // ============================================================
-static const int AUDIO_BUF = 16384 * 2;  // int16 units (16384 stereo frames)
 static int16_t   g_audio_buf[AUDIO_BUF];
 static int       g_audio_write = 0;
-static unsigned  g_audio_sample_rate = 44100;
+static unsigned  g_audio_sample_rate = DEFAULT_SAMPLE_RATE;
 
 static std::vector<uint8_t> g_frame_rgba;
 static unsigned g_frame_w  = 160, g_frame_h = 144; // updated by retro_video_refresh
 
 static retro_pixel_format g_pixfmt = RETRO_PIXEL_FORMAT_0RGB1555;
 static bool     g_running  = false;
-static bool     g_buttons[4][16] = {};  // [port][button], up to 4 simultaneous players
-static int16_t  g_analog[4][2][2] = {}; // [port][stick][axis] — stick 0=left,1=right; axis 0=X,1=Y
+static bool     g_buttons[MAX_PORTS][MAX_BUTTONS] = {};
+static int16_t  g_analog[MAX_PORTS][2][2] = {};    // [port][stick][axis]
 
 // ============================================================
 //  Libretro callbacks
@@ -90,9 +97,9 @@ size_t retro_audio_sample_batch(const int16_t* data, size_t frames) {
 }
 void   retro_input_poll() {}
 int16_t retro_input_state(unsigned port,unsigned device,unsigned idx,unsigned id) {
-    if (port>=4) return 0;
+    if (port>=MAX_PORTS) return 0;
     if (device==RETRO_DEVICE_JOYPAD) {
-        if (id>=16) return 0;
+        if (id>=MAX_BUTTONS) return 0;
         return g_buttons[port][id]?1:0;
     }
     if (device==RETRO_DEVICE_ANALOG) {
@@ -122,11 +129,11 @@ bool retro_environment(unsigned cmd, void* data) {
 // ============================================================
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_button(int port, int id, int pressed) {
-    if (port>=0&&port<4&&id>=0&&id<16) g_buttons[port][id]=pressed;
+    if (port>=0&&port<MAX_PORTS&&id>=0&&id<MAX_BUTTONS) g_buttons[port][id]=pressed;
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void set_analog(int port, int stick, int axis, int value) {
-    if (port>=0&&port<4&&stick>=0&&stick<2&&axis>=0&&axis<2)
+    if (port>=0&&port<MAX_PORTS&&stick>=0&&stick<2&&axis>=0&&axis<2)
         g_analog[port][stick][axis] = (int16_t)value;
 }
 

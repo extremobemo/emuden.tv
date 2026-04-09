@@ -2,9 +2,11 @@
 // Also owns BIOS/save file state and the frame-upload + quad-color utilities
 // shared by n64.js and multiplayer.js.
 
-import { state, shareCanvas, shareCtx } from './state.js';
+import { state, setState, shareCtx } from './state.js';
 import { startAudio, receiveAudio } from './audio.js';
 import { setStatus } from './utils.js';
+import * as renderer from './renderer.js';
+import { SHARE_CANVAS_W, SHARE_CANVAS_H, BUILD_DIR } from './config.js';
 
 // BIOS/save state — kept module-local, sent to worker on spawn
 let _ps1BiosName  = null;
@@ -25,7 +27,6 @@ export function setSaturnBiosFile(bytes) {
   saturnBiosLoaded = true;
 }
 
-
 // Scratch canvas for frame mirroring to shareCanvas (WebRTC host streaming)
 const frameTmp = document.createElement('canvas');
 let   frameTmpCtx = null;
@@ -38,26 +39,24 @@ const _quadSampleCtx = _quadSampleCanvas.getContext('2d', { willReadFrequently: 
 // Sample a video source (canvas or video element) into 4 quadrant average colours.
 // Used by n64.js (copyLoop) and multiplayer.js (guest video stream).
 export function jsUpdateQuadColors(source) {
-  if (!state.rendererModule) return;
+  if (!renderer.isReady()) return;
   try {
     _quadSampleCtx.drawImage(source, 0, 0, 2, 2);
     const d = _quadSampleCtx.getImageData(0, 0, 2, 2).data;
     // 2×2 layout (y=0 top): d[0..3]=TL d[4..7]=TR d[8..11]=BL d[12..15]=BR
     // Must match C++ quad order: q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
-    state.rendererModule.ccall('set_tv_quad_colors', null,
-      ['number','number','number','number','number','number',
-       'number','number','number','number','number','number'],
-      [d[8]/255,  d[9]/255,  d[10]/255,   // q0 BL
-       d[12]/255, d[13]/255, d[14]/255,   // q1 BR
-       d[0]/255,  d[1]/255,  d[2]/255,    // q2 TL
-       d[4]/255,  d[5]/255,  d[6]/255]);  // q3 TR
+    renderer.setTvQuadColors(
+      d[8]/255,  d[9]/255,  d[10]/255,   // q0 BL
+      d[12]/255, d[13]/255, d[14]/255,   // q1 BR
+      d[0]/255,  d[1]/255,  d[2]/255,    // q2 TL
+      d[4]/255,  d[5]/255,  d[6]/255);   // q3 TR
   } catch(e) { console.warn('jsUpdateQuadColors:', e); }
 }
 
 // Sample 4 quadrant average colors from a raw RGBA buffer and push to renderer.
 // Used by libretro core frames received from the worker (avoids a canvas round-trip).
 function jsUpdateQuadColors_fromBuffer(rgba, fw, fh) {
-  if (!state.rendererModule) return;
+  if (!renderer.isReady()) return;
   const hw = fw >> 1, hh = fh >> 1;
   // q0=left-bottom, q1=right-bottom, q2=left-top, q3=right-top
   const regions = [
@@ -76,26 +75,25 @@ function jsUpdateQuadColors_fromBuffer(rgba, fw, fh) {
       }
     cols.push(r/(cnt*255), g/(cnt*255), b/(cnt*255));
   }
-  state.rendererModule.ccall('set_tv_quad_colors', null, Array(12).fill('number'), cols);
+  renderer.setTvQuadColors(...cols);
 }
 
 // Upload a game frame (received from the worker) into the TV screen texture.
 export function receiveFrame(buf, fw, fh) {
-  if (!state.rendererModule || !state.frontendGL || !state.frontendCtx) return;
-  state.rendererModule.ccall('set_frame_size', 'void', ['number','number'], [fw, fh]);
-  const texId = state.rendererModule.ccall('get_game_tex_id', 'number', [], []);
-  const tex = state.frontendGL.textures[texId];
+  const glTextures = renderer.getGLTextures();
+  const gl = renderer.getGLContext();
+  if (!renderer.isReady() || !glTextures || !gl) return;
+
+  renderer.setFrameSize(fw, fh);
+  const texId = renderer.getGameTexId();
+  const tex = glTextures[texId];
   if (!tex) return;
 
   const rgba = new Uint8ClampedArray(buf, 0, fw * fh * 4);
-  state.frontendCtx.bindTexture(state.frontendCtx.TEXTURE_2D, tex);
-  state.frontendCtx.texImage2D(state.frontendCtx.TEXTURE_2D, 0,
-    state.frontendCtx.RGBA, fw, fh, 0, state.frontendCtx.RGBA,
-    state.frontendCtx.UNSIGNED_BYTE, rgba);
-  state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-    state.frontendCtx.TEXTURE_MIN_FILTER, state.frontendCtx.LINEAR);
-  state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-    state.frontendCtx.TEXTURE_MAG_FILTER, state.frontendCtx.LINEAR);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, fw, fh, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
   jsUpdateQuadColors_fromBuffer(rgba, fw, fh);
 
@@ -106,7 +104,7 @@ export function receiveFrame(buf, fw, fh) {
       frameTmpCtx = frameTmp.getContext('2d');
     }
     frameTmpCtx.putImageData(new ImageData(rgba, fw, fh), 0, 0);
-    shareCtx.drawImage(frameTmp, 0, 0, 640, 480);
+    shareCtx.drawImage(frameTmp, 0, 0, SHARE_CANVAS_W, SHARE_CANVAS_H);
   }
 }
 
@@ -125,17 +123,18 @@ function onWorkerMessage(e) {
 
 // Terminate any running core Worker and spin up a new one for the given bundle.
 export function spawnCoreWorker(bundle, file, ext) {
-  if (state.coreWorker) { state.coreWorker.terminate(); state.coreWorker = null; }
-  state.n64Running = false;  // stop N64 copyLoop from blitting over the new core's frames
+  if (state.coreWorker) { state.coreWorker.terminate(); setState('coreWorker', null); }
+  setState('n64Running', false);  // stop N64 copyLoop from blitting over the new core's frames
   setStatus('Loading core...');
   const reader = new FileReader();
   reader.onload = function(ev) {
-    state.coreWorker = new Worker('core_worker.js?v=' + Date.now());
-    state.coreWorker.onmessage = onWorkerMessage;
-    state.coreWorker.onerror = function(e) {
+    const worker = new Worker('js/core_worker.js?v=' + Date.now());
+    worker.onmessage = onWorkerMessage;
+    worker.onerror = function(e) {
       setStatus('Worker error: ' + (e.message || e));
     };
-    state.nowPlaying = file.name;
+    setState('coreWorker', worker);
+    setState('nowPlaying', file.name);
     const msg = {
       type:     'load',
       bundle:   bundle,
@@ -143,16 +142,16 @@ export function spawnCoreWorker(bundle, file, ext) {
       romBytes: ev.target.result,  // transferred (zero-copy)
       version:  Date.now(),
     };
-    if (bundle === 'core_ps1.js' && _ps1BiosBytes) {
+    if (bundle.endsWith('core_ps1.js') && _ps1BiosBytes) {
       msg.biosName  = _ps1BiosName;
       msg.biosBytes = _ps1BiosBytes.buffer.slice(0);  // copy — keep original
     }
-    if (bundle === 'core_saturn.js' && _saturnBiosBytes) {
+    if (bundle.endsWith('core_saturn.js') && _saturnBiosBytes) {
       msg.biosBytes   = _saturnBiosBytes.buffer.slice(0);
       msg.biosType    = 'saturn';
     }
 
-    state.coreWorker.postMessage(msg, [msg.romBytes]);
+    worker.postMessage(msg, [msg.romBytes]);
   };
   reader.readAsArrayBuffer(file);
 }

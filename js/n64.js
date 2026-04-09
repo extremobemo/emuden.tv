@@ -1,38 +1,32 @@
 // N64 emulation — SEPARATE CODE PATH from the libretro/Worker architecture.
 //
-// All other cores (GBC, GBA, SNES, PS1) use frontend.cpp compiled with -DCORE_ONLY,
-// run inside core_worker.js as a Web Worker, and communicate via postMessage.
-//
-// N64 uses nbarkhina/N64Wasm — a completely different emulator that predates this
-// Worker architecture and does not implement the libretro interface. Key differences:
-//   - Runs on the main thread (not a Worker) via an IIFE
-//   - Uses SDL internally; fires its own requestAnimationFrame loop
-//   - Writes directly to a WebGL context on <canvas id="n64canvas"> (off-screen)
-//   - Requires assets.zip + config.txt written to its FS before callMain()
-//   - Frames are copied: n64canvas → 2D blit canvas → main WebGL TV texture each frame
-//     (Firefox refuses texImage2D from a WebGL2 canvas into a WebGL1 context, hence
-//      the intermediate 2D canvas step)
-//
-// This is why loadN64() exists as a standalone function rather than routing through
-// spawnCoreWorker() in worker-bridge.js.
+// N64 uses nbarkhina/N64Wasm — a completely different emulator that runs on the
+// main thread with its own SDL/WebGL context. See CLAUDE.md for full details.
 
-import { state, shareCtx } from './state.js';
+import { state, setState, shareCtx } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
 import { setStatus } from './utils.js';
 import { initN64VirtualPads } from './virtual-gamepad.js';
 import { buildN64Config, N64_PAD, N64_KB } from './n64-bindings.js';
+import * as renderer from './renderer.js';
+import {
+  N64_AXIS_THRESHOLD, N64_AUDIO_RING, N64_AUDIO_BUFFER,
+  N64_FRAME_W, N64_FRAME_H, GAMEPAD_EVENT_DELAY_MS,
+  SHARE_CANVAS_W, SHARE_CANVAS_H, BUILD_DIR,
+} from './config.js';
+
+// rAF IDs for lifecycle management
+let _copyLoopAnim = null;
+let _axisPollAnim = null;
 
 // Wrap n64wasm.js in an IIFE before injecting.
-// n64wasm.js (Emscripten 2.0.7) uses var/function declarations that conflict with
-// let/class in the newer Emscripten output used by the renderer bundle.
-// Fix: fetch as text, wrap in an IIFE, expose only Module via window._n64M.
 function loadN64Wasm(callback) {
   window._n64ModuleInit = {
     canvas: document.getElementById('n64canvas'),
     noInitialRun: true,
-    locateFile: function(path) { return path; },
+    locateFile: function(path) { return BUILD_DIR + path; },
   };
-  fetch('n64wasm.js')
+  fetch(BUILD_DIR + 'n64wasm.js')
     .then(function(r) { return r.text(); })
     .then(function(code) {
       const wrapped = '(function(){\nvar Module=window._n64ModuleInit||{};\n'
@@ -58,8 +52,7 @@ function loadN64Wasm(callback) {
     .catch(function() { setStatus('Failed to fetch n64wasm.js'); });
 }
 
-// Translates a N64Wasm key string (e.g. 'i', 'Enter', 'Up') back to
-// KeyboardEvent init properties so synthetic events reach Emscripten/SDL.
+// Translates a N64Wasm key string back to KeyboardEvent init properties.
 function _n64KeyToProps(n64key) {
   const named = {
     Up: { key: 'ArrowUp',    code: 'ArrowUp'    },
@@ -79,15 +72,13 @@ function _n64KeyToProps(n64key) {
 }
 
 // Polls right-stick axes each frame and dispatches keyboard events when an
-// axis-bound C-button crosses the threshold.  This runs for the lifetime of
-// the N64 session; axis bindings are stored as "axis:N:D" strings in N64_PAD.
+// axis-bound C-button crosses the threshold.
 function _startN64AxisPoll() {
-  const THRESHOLD  = 0.5;
   const C_ACTIONS  = ['CUp', 'CDown', 'CLeft', 'CRight'];
   const _prev = {};
 
   (function poll() {
-    if (!state.n64Running) return;
+    if (!state.n64Running) { _axisPollAnim = null; return; }
     const gps = navigator.getGamepads ? navigator.getGamepads() : [];
     const gp  = [...gps].find(g => g && g.connected && !g.id.startsWith('Virtual'));
     if (gp) {
@@ -96,7 +87,7 @@ function _startN64AxisPoll() {
         if (typeof binding !== 'string' || !binding.startsWith('axis:')) continue;
         const [, aStr, dStr] = binding.split(':');
         const val     = gp.axes[+aStr] || 0;
-        const pressed = +dStr > 0 ? val > THRESHOLD : val < -THRESHOLD;
+        const pressed = +dStr > 0 ? val > N64_AXIS_THRESHOLD : val < -N64_AXIS_THRESHOLD;
         if (pressed !== !!_prev[action]) {
           _prev[action] = pressed;
           const kbKey = N64_KB[action];
@@ -110,8 +101,33 @@ function _startN64AxisPoll() {
         }
       }
     }
-    requestAnimationFrame(poll);
+    _axisPollAnim = requestAnimationFrame(poll);
   })();
+}
+
+// N64Wasm audio: reads resampled stereo Int16 audio from the WASM heap ring buffer.
+function _startN64Audio(n64Mod, audioCtx) {
+  const bufPtr = n64Mod._neilGetSoundBufferResampledAddress();
+  const audioRing = new Int16Array(n64Mod.HEAP16.buffer, bufPtr, N64_AUDIO_RING);
+  let readPos = 0;
+
+  const node = audioCtx.createScriptProcessor(N64_AUDIO_BUFFER, 0, 2);
+  node.onaudioprocess = function(ev) {
+    const L = ev.outputBuffer.getChannelData(0);
+    const R = ev.outputBuffer.getChannelData(1);
+    const writePos = n64Mod._neilGetAudioWritePosition();
+
+    for (let i = 0; i < L.length; i++) {
+      if (readPos !== writePos) {
+        L[i] = audioRing[readPos] / 32768;
+        R[i] = audioRing[readPos + 1] / 32768;
+        readPos = (readPos + 2) % N64_AUDIO_RING;
+      } else {
+        L[i] = R[i] = 0;
+      }
+    }
+  };
+  node.connect(audioCtx.destination);
 }
 
 export function loadN64(file) {
@@ -121,86 +137,92 @@ export function loadN64(file) {
     return;
   }
   // Stop any running libretro worker
-  if (state.coreWorker) { state.coreWorker.terminate(); state.coreWorker = null; }
+  if (state.coreWorker) { state.coreWorker.terminate(); setState('coreWorker', null); }
 
   setStatus('Loading N64 emulator...');
 
+  // Pre-create an AudioContext while the user gesture is still active.
+  const _OrigAC = window.AudioContext || window.webkitAudioContext;
+  let _n64AudioCtx;
+  try { _n64AudioCtx = new _OrigAC({ sampleRate: 44100 }); _n64AudioCtx.resume(); } catch(e) {}
+
+  // Stub out myApp so EM_ASM calls in n64wasm.js don't throw
+  if (!window.myApp) window.myApp = {};
+  window.myApp.localCallback = function() {};
+
   // Renderer is already loaded — set up game texture for N64 resolution
-  const texId = state.rendererModule.ccall('get_game_tex_id', 'number', [], []);
-  state.rendererModule.ccall('set_frame_size', 'void', ['number','number'], [640, 480]);
+  renderer.getGameTexId();
+  renderer.setFrameSize(N64_FRAME_W, N64_FRAME_H);
 
   loadN64Wasm(function(n64Mod) {
-    state.n64Module = n64Mod;
+    setState('n64Module', n64Mod);
 
     setStatus('Loading ' + file.name + '...');
     const reader = new FileReader();
     reader.onload = function(ev) {
       const romBytes = new Uint8Array(ev.target.result);
 
-      // N64Wasm requires assets.zip, config.txt, and cheat.txt before callMain
-      fetch('assets.zip')
+      fetch(BUILD_DIR + 'assets.zip')
         .then(function(r) { return r.arrayBuffer(); })
         .then(function(assetsBuf) {
           const fs = state.n64Module.FS;
           fs.writeFile('assets.zip', new Uint8Array(assetsBuf));
-
           fs.writeFile('config.txt', buildN64Config());
           fs.writeFile('cheat.txt', '');
           fs.writeFile('custom.v64', romBytes);
 
-          try { new AudioContext().resume(); } catch(e) {}
-          // Pre-register virtual pads 0 (neutral P1 dummy) and 1 (guest P2)
-          // before callMain so SDL_Init sees them during joystick scan.
           initN64VirtualPads();
           state.n64Module.callMain(['custom.v64']);
-          state.n64Running = true;
+          setState('n64Running', true);
+
+          if (_n64AudioCtx) _startN64Audio(n64Mod, _n64AudioCtx);
           _startN64AxisPoll();
-          // SDL2 opens joystick handles via 'gamepadconnected' events, not just
-          // by reading navigator.getGamepads(). Dispatch them after callMain so
-          // SDL's joystick subsystem is fully initialized before we announce the
-          // virtual pads — otherwise axis polling won't flow through for P2.
+
           setTimeout(function() {
             [0, 1].forEach(function(i) {
               const pad = navigator.getGamepads()[i];
               if (pad) window.dispatchEvent(new GamepadEvent('gamepadconnected', { gamepad: pad }));
             });
-          }, 500);
-          state.nowPlaying = file.name;
+          }, GAMEPAD_EVENT_DELAY_MS);
+
+          setState('nowPlaying', file.name);
           setStatus(file.name);
 
           // Copy n64canvas → TV texture every frame via an intermediate 2D canvas.
-          // Firefox refuses texImage2D(webgl2Canvas) into a WebGL1 context, so we
-          // go through a 2D canvas first. frontendGL/frontendCtx were captured at
-          // renderer load time, before n64wasm overwrote window.GL.
           const n64canvas   = document.getElementById('n64canvas');
           const blitCanvas  = document.createElement('canvas');
           blitCanvas.width  = n64canvas.width;
           blitCanvas.height = n64canvas.height;
           const blit2d = blitCanvas.getContext('2d');
 
+          const texId = renderer.getGameTexId();
+
           (function copyLoop() {
             if (state.n64Running) {
-              const tex = state.frontendGL.textures[texId];
-              if (tex) {
+              const glTextures = renderer.getGLTextures();
+              const gl = renderer.getGLContext();
+              const tex = glTextures && glTextures[texId];
+              if (tex && gl) {
                 blit2d.drawImage(n64canvas, 0, 0);
                 jsUpdateQuadColors(blitCanvas);
-                state.frontendCtx.bindTexture(state.frontendCtx.TEXTURE_2D, tex);
-                state.frontendCtx.texImage2D(state.frontendCtx.TEXTURE_2D, 0,
-                  state.frontendCtx.RGBA, state.frontendCtx.RGBA,
-                  state.frontendCtx.UNSIGNED_BYTE, blitCanvas);
-                state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-                  state.frontendCtx.TEXTURE_MIN_FILTER, state.frontendCtx.LINEAR);
-                state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-                  state.frontendCtx.TEXTURE_MAG_FILTER, state.frontendCtx.LINEAR);
+                gl.bindTexture(gl.TEXTURE_2D, tex);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, blitCanvas);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
                 // Mirror to shareCanvas for WebRTC streaming
-                shareCtx.drawImage(blitCanvas, 0, 0, 640, 480);
+                shareCtx.drawImage(blitCanvas, 0, 0, SHARE_CANVAS_W, SHARE_CANVAS_H);
               }
             }
-            requestAnimationFrame(copyLoop);
+            _copyLoopAnim = requestAnimationFrame(copyLoop);
           })();
         })
         .catch(function() { setStatus('Failed to load assets.zip'); });
     };
     reader.readAsArrayBuffer(file);
   });
+}
+
+export function stopN64() {
+  if (_copyLoopAnim !== null) { cancelAnimationFrame(_copyLoopAnim); _copyLoopAnim = null; }
+  if (_axisPollAnim !== null) { cancelAnimationFrame(_axisPollAnim); _axisPollAnim = null; }
 }

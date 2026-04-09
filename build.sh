@@ -7,6 +7,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Build products go here — keeps root clean
+BUILD_OUT="$SCRIPT_DIR/build"
+mkdir -p "$BUILD_OUT"
+
 RENDERER_EXPORTS='["_main","_set_move_key","_add_mouse_delta","_get_game_tex_id","_set_frame_size","_upload_frame","_get_local_x","_get_local_y","_get_local_z","_get_local_yaw","_get_local_pitch","_set_remote_player","_remove_remote_player","_get_tv_x","_get_tv_y","_get_tv_z","_set_overscan","_set_room_xform","_set_lamp_pos","_set_lamp_intensity","_set_tv_light_intensity","_set_tv_quad_colors","_set_cone_yaw","_set_cone_pitch","_set_cone_power","_get_local_moving","_set_cat_eye_height","_set_local_y","_set_remote_player_model","_set_debug_cube_pos","_set_debug_cube_visible","_get_name_upload_buf","_set_remote_player_name_tex","_set_preview_mode","_exit_preview_mode","_set_preview_transform"]'
 
 CORE_EXPORTS='["_main","_start_game","_set_button","_set_analog","_step_frame","_get_frame_ptr","_get_frame_w","_get_frame_h","_get_audio_buf_ptr","_get_audio_write_pos","_get_audio_buf_size","_get_audio_sample_rate"]'
@@ -81,19 +85,28 @@ if [ ! -f "$COMMON_A" ]; then
   emar rcs "$COMMON_A" $COBJS
 fi
 
-# ── 4. Link renderer bundle (main thread, loads once on page open) ────────────
+# ── 4. Compile + link renderer bundle (main thread, loads once on page open) ──
 # INITIAL_MEMORY=64 MB: 3D scene geometry, textures, and avatar models
+RENDERER_SRCS="renderer.cpp renderer_math.cpp renderer_gl_utils.cpp renderer_scene.cpp renderer_crt.cpp renderer_anim.cpp renderer_render.cpp"
+echo "Compiling renderer sources..."
+RENDERER_OBJS=""
+for src in $RENDERER_SRCS; do
+  obj="src/${src%.cpp}.o"
+  em++ -O2 -std=c++17 -I include -c "src/$src" -o "$obj"
+  RENDERER_OBJS="$RENDERER_OBJS $obj"
+done
 echo "Linking game_renderer.js..."
 em++ -O2 -std=c++17 \
-  -I include \
-  renderer.cpp \
+  $RENDERER_OBJS \
   -s FULL_ES3=1 \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8"]' \
   -s EXPORTED_FUNCTIONS="$RENDERER_EXPORTS" \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=67108864 \
   --preload-file tv/ \
-  -o game_renderer.js
+  --extern-pre-js src/renderer_pre.js \
+  -o "$BUILD_OUT/game_renderer.js"
+rm -f $RENDERER_OBJS src/*.o
 
 # ── 5. Link GBC core bundle (Web Worker) ─────────────────────────────────────
 # INITIAL_MEMORY=128 MB: Gambatte needs extra headroom for VRAM + save-state buffers
@@ -101,7 +114,7 @@ echo "Linking core_gbc.js..."
 em++ -O2 -std=c++17 \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
-  core.cpp \
+  src/core.cpp \
   "$COMMON_A" \
   "$GAMBATTE_A" \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
@@ -109,7 +122,7 @@ em++ -O2 -std=c++17 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
   -s ENVIRONMENT=worker \
-  -o core_gbc.js
+  -o "$BUILD_OUT/core_gbc.js"
 
 # ── 6. Build snes9x core ──────────────────────────────────────────────────────
 SNES9X_A=cores/snes9x/snes9x_libretro.a
@@ -124,7 +137,7 @@ echo "Linking core_snes.js..."
 em++ -O2 -std=c++17 \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
-  core.cpp \
+  src/core.cpp \
   "$COMMON_A" \
   "$SNES9X_A" \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
@@ -132,7 +145,7 @@ em++ -O2 -std=c++17 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
   -s ENVIRONMENT=worker \
-  -o core_snes.js
+  -o "$BUILD_OUT/core_snes.js"
 
 # ── 8. Build PCSX-ReARMed core ────────────────────────────────────────────────
 PCSX_A=cores/pcsx_rearmed/pcsx_rearmed_libretro.a
@@ -147,7 +160,7 @@ echo "Linking core_ps1.js..."
 em++ -O2 -std=c++17 \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
-  core.cpp \
+  src/core.cpp \
   "$COMMON_A" \
   "$PCSX_A" \
   -sUSE_ZLIB=1 \
@@ -156,7 +169,7 @@ em++ -O2 -std=c++17 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=268435456 \
   -s ENVIRONMENT=worker \
-  -o core_ps1.js
+  -o "$BUILD_OUT/core_ps1.js"
 
 # ── 10. Build mGBA core ───────────────────────────────────────────────────────
 MGBA_A=cores/mgba/mgba_libretro.a
@@ -171,7 +184,7 @@ echo "Linking core_gba.js..."
 em++ -O2 -std=c++17 \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
-  core.cpp \
+  src/core.cpp \
   "$COMMON_A" \
   "$MGBA_A" \
   -sUSE_ZLIB=1 \
@@ -180,7 +193,7 @@ em++ -O2 -std=c++17 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=134217728 \
   -s ENVIRONMENT=worker \
-  -o core_gba.js
+  -o "$BUILD_OUT/core_gba.js"
 
 # ── 12. Build Yabause core (Sega Saturn) ─────────────────────────────────────
 YABAUSE_A=cores/yabause/yabause_libretro.a
@@ -213,7 +226,7 @@ echo "Linking core_saturn.js..."
 em++ -O2 -std=c++17 \
   -I include \
   -I "$LIBRETRO_COMMON/include" \
-  core.cpp \
+  src/core.cpp \
   "$COMMON_A" \
   "$YABAUSE_A" \
   -s EXPORTED_RUNTIME_METHODS='["ccall","FS","HEAPU8","HEAP16"]' \
@@ -221,16 +234,16 @@ em++ -O2 -std=c++17 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=268435456 \
   -s ENVIRONMENT=worker \
-  -o core_saturn.js
+  -o "$BUILD_OUT/core_saturn.js"
 
 # ── 14. Download N64Wasm prebuilt files ───────────────────────────────────────
-if [ ! -f n64wasm.js ]; then
+if [ ! -f "$BUILD_OUT/n64wasm.js" ]; then
   echo "Downloading N64Wasm prebuilt..."
-  curl -Lo n64wasm.js \
+  curl -Lo "$BUILD_OUT/n64wasm.js" \
     https://raw.githubusercontent.com/nbarkhina/N64Wasm/master/dist/n64wasm.js
-  curl -Lo n64wasm.wasm \
+  curl -Lo "$BUILD_OUT/n64wasm.wasm" \
     https://raw.githubusercontent.com/nbarkhina/N64Wasm/master/dist/n64wasm.wasm
-  curl -Lo assets.zip \
+  curl -Lo "$BUILD_OUT/assets.zip" \
     https://github.com/nbarkhina/N64Wasm/raw/master/dist/assets.zip
 fi
 

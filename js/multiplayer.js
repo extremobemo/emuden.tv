@@ -2,11 +2,15 @@
 // Host streams the game canvas as video; guests send position data via data channel.
 // PeerJS is loaded from CDN as a non-module script, so it lives on window.Peer.
 
-import { state, shareCanvas, shareCtx } from './state.js';
+import { state, setState, shareCanvas } from './state.js';
 import { jsUpdateQuadColors } from './worker-bridge.js';
-import { setStatus } from './utils.js';
 import { getGameAudioTrack, startViewerAudio, setAudioSourcePos, setAudioPannerSettings } from './audio.js';
 import { setVirtualButton, setVirtualAxis } from './virtual-gamepad.js';
+import * as renderer from './renderer.js';
+import {
+  POSITION_SYNC_INTERVAL_MS, MAX_REMOTE_PLAYERS, VIDEO_BITRATE,
+  VIDEO_FRAMERATE, NAMEPLATE_W, NAMEPLATE_H, RETRO,
+} from './config.js';
 
 // Reverse of PAD_BUTTON_MAP in input.js: libretro button ID → standard gamepad button index
 const RETRO_TO_PAD = {};
@@ -17,28 +21,25 @@ let peerInst    = null;
 let mpConns     = [];
 let gameStream  = null;
 let hostConn    = null;   // guest-side: connection back to the host
-let remoteNames = new Array(8).fill('');  // last-seen name per remote slot
+let remoteNames = new Array(MAX_REMOTE_PLAYERS).fill('');
 
 // Generate a nameplate RGBA texture and upload it to C++ for the given remote slot
 function uploadNameplate(slotId, name) {
-  if (!state.rendererModule || !name) return;
-  const W = 256, H = 64;
+  if (!renderer.isReady() || !name) return;
   const c = document.createElement('canvas');
-  c.width = W; c.height = H;
+  c.width = NAMEPLATE_W; c.height = NAMEPLATE_H;
   const ctx = c.getContext('2d');
-  ctx.clearRect(0, 0, W, H);
+  ctx.clearRect(0, 0, NAMEPLATE_W, NAMEPLATE_H);
   ctx.fillStyle = 'rgba(0,0,0,0.65)';
-  ctx.fillRect(6, 6, W - 12, H - 12);
+  ctx.fillRect(6, 6, NAMEPLATE_W - 12, NAMEPLATE_H - 12);
   ctx.fillStyle = '#ffffff';
   ctx.font = 'bold 28px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(name, W / 2, H / 2, W - 24);
-  const imgData = ctx.getImageData(0, 0, W, H);
-  const M = state.rendererModule;
-  const ptr = M.ccall('get_name_upload_buf', 'number', [], []);
-  M.HEAPU8.set(imgData.data, ptr);
-  M.ccall('set_remote_player_name_tex', null, ['number','number','number'], [slotId, W, H]);
+  ctx.fillText(name, NAMEPLATE_W / 2, NAMEPLATE_H / 2, NAMEPLATE_W - 24);
+  const imgData = ctx.getImageData(0, 0, NAMEPLATE_W, NAMEPLATE_H);
+  renderer.writeNameBuf(imgData.data);
+  renderer.setRemotePlayerNameTex(slotId, NAMEPLATE_W, NAMEPLATE_H);
 }
 
 // Send a button event to the host (called by input.js when this guest has control)
@@ -102,23 +103,20 @@ function applySceneState(s) {
   set('audio-rolloff', s.audioRolloff);  txt('audio-rolloff-val', s.audioRolloff);
   const mdl = document.getElementById('audio-model'); if (mdl) mdl.value = s.audioModel;
 
-  if (state.rendererModule) {
-    const M = state.rendererModule;
-    M.ccall('set_overscan',          null, ['number','number'],                         [s.overscanX, s.overscanY]);
-    M.ccall('set_room_xform',        null, ['number','number','number','number','number'],[s.roomScale, s.roomRotY, s.roomTx, s.roomTy, s.roomTz]);
-    M.ccall('set_lamp_pos',          null, ['number','number','number'],                [s.lampX, s.lampY, s.lampZ]);
-    M.ccall('set_lamp_intensity',    null, ['number'],                                  [s.lampIntensity]);
-    M.ccall('set_tv_light_intensity',null, ['number'],                                  [s.tvIntensity]);
-    M.ccall('set_cone_yaw',          null, ['number'],                                  [s.coneYaw]);
-    M.ccall('set_cone_pitch',        null, ['number'],                                  [s.conePitch]);
-    M.ccall('set_cone_power',        null, ['number'],                                  [s.conePower]);
-  }
+  renderer.setOverscan(s.overscanX, s.overscanY);
+  renderer.setRoomXform(s.roomScale, s.roomRotY, s.roomTx, s.roomTy, s.roomTz);
+  renderer.setLampPos(s.lampX, s.lampY, s.lampZ);
+  renderer.setLampIntensity(s.lampIntensity);
+  renderer.setTvLightIntensity(s.tvIntensity);
+  renderer.setConeYaw(s.coneYaw);
+  renderer.setConePitch(s.conePitch);
+  renderer.setConePower(s.conePower);
+
   setAudioSourcePos(s.audioX, s.audioY, s.audioZ);
   setAudioPannerSettings(s.audioRefDist, s.audioMaxDist, s.audioRolloff, s.audioModel);
   const cubeEl = document.getElementById('audio-debug-cube');
   if (cubeEl) cubeEl.checked = !!s.audioCubeVisible;
-  if (state.rendererModule && state.rendererModule._set_debug_cube_visible)
-    state.rendererModule.ccall('set_debug_cube_visible', null, ['number'], [s.audioCubeVisible ? 1 : 0]);
+  renderer.setDebugCubeVisible(s.audioCubeVisible ? 1 : 0);
   if (s.nowPlaying !== undefined) {
     const statusEl = document.getElementById('status');
     if (statusEl) statusEl.textContent = s.nowPlaying || '';
@@ -138,31 +136,28 @@ function mpSetStatus(msg) {
 // Broadcast local player position + model to all connected peers at 60 Hz
 function startPositionSync(conn) {
   setInterval(function() {
-    if (!conn.open || !state.rendererModule) return;
+    if (!conn.open || !renderer.isReady()) return;
     conn.send({
       type:   'pos',
-      x:      state.rendererModule.ccall('get_local_x',      'number', [], []),
-      y:      state.rendererModule.ccall('get_local_y',      'number', [], []),
-      z:      state.rendererModule.ccall('get_local_z',      'number', [], []),
-      yaw:    state.rendererModule.ccall('get_local_yaw',    'number', [], []),
-      moving: state.rendererModule.ccall('get_local_moving', 'number', [], []),
+      x:      renderer.getLocalXCcall(),
+      y:      renderer.getLocalYCcall(),
+      z:      renderer.getLocalZCcall(),
+      yaw:    renderer.getLocalYawCcall(),
+      moving: renderer.getLocalMovingCcall(),
       model:  state.localModel,
       name:   state.localName,
     });
-  }, 16);
+  }, POSITION_SYNC_INTERVAL_MS);
 }
 
 // Start capturing game frames into shareCanvas for WebRTC streaming.
-// The actual blit happens inside receiveFrame() (libretro) or the N64 copyLoop.
 function startFrameCapture() {
-  gameStream = shareCanvas.captureStream(60);
+  gameStream = shareCanvas.captureStream(VIDEO_FRAMERATE);
   const vTrack = gameStream.getVideoTracks()[0];
   if (vTrack) vTrack.contentHint = 'motion';
 }
 
 // Rewrite SDP to prefer H.264 Baseline (profile-level-id 42e*/4200*).
-// Baseline has no B-frames so every frame decodes immediately — eliminates
-// the 2-3 frame lookahead latency introduced by High profile or VP8 B-frames.
 function preferH264Baseline(sdp) {
   const lines = sdp.split('\r\n');
   let basePt = null;
@@ -179,15 +174,14 @@ function preferH264Baseline(sdp) {
   }).join('\r\n');
 }
 
-// Ask the browser to encode at high priority, 60 fps max, 2.5 Mbps.
-// Called after the peer connection is established so getSenders() is populated.
+// Ask the browser to encode at high priority, 60 fps max.
 function applyLowLatencyEncoding(pc) {
   pc.getSenders().forEach(function(sender) {
     if (!sender.track || sender.track.kind !== 'video') return;
     const p = sender.getParameters();
     if (!p.encodings || !p.encodings.length) p.encodings = [{}];
-    p.encodings[0].maxBitrate      = 4_000_000;
-    p.encodings[0].maxFramerate    = 60;
+    p.encodings[0].maxBitrate      = VIDEO_BITRATE;
+    p.encodings[0].maxFramerate    = VIDEO_FRAMERATE;
     p.encodings[0].priority        = 'high';
     p.encodings[0].networkPriority = 'high';
     sender.setParameters(p).catch(e => console.warn('setParameters:', e));
@@ -195,8 +189,6 @@ function applyLowLatencyEncoding(pc) {
 }
 
 // Blit a received video stream into the TV texture (guest-side WebRTC receive).
-// Uses requestVideoFrameCallback when available so we only upload to the GPU
-// when a new decoded frame actually arrives, instead of every rAF tick.
 function setupVideoReceive(stream) {
   const videoEl = document.createElement('video');
   videoEl.autoplay = true; videoEl.playsInline = true; videoEl.muted = true;
@@ -204,24 +196,22 @@ function setupVideoReceive(stream) {
   videoEl.srcObject = stream;
   videoEl.play().catch(e => console.warn('mp video:', e));
 
-  const texId = state.rendererModule.ccall('get_game_tex_id', 'number', [], []);
+  const texId = renderer.getGameTexId();
   let frameSizeSet = false;
 
   function blitFrame() {
-    if (videoEl.readyState < 2 || !state.frontendGL || !state.frontendCtx) return;
+    const glTextures = renderer.getGLTextures();
+    const gl = renderer.getGLContext();
+    if (videoEl.readyState < 2 || !glTextures || !gl) return;
     if (!frameSizeSet && videoEl.videoWidth && videoEl.videoHeight) {
-      state.rendererModule.ccall('set_frame_size', 'void', ['number','number'],
-        [videoEl.videoWidth, videoEl.videoHeight]);
+      renderer.setFrameSize(videoEl.videoWidth, videoEl.videoHeight);
       frameSizeSet = true;
     }
-    const tex = state.frontendGL.textures[texId];
+    const tex = glTextures[texId];
     if (tex) {
-      state.frontendCtx.bindTexture(state.frontendCtx.TEXTURE_2D, tex);
-      state.frontendCtx.texImage2D(state.frontendCtx.TEXTURE_2D, 0,
-        state.frontendCtx.RGBA, state.frontendCtx.RGBA,
-        state.frontendCtx.UNSIGNED_BYTE, videoEl);
-      state.frontendCtx.texParameteri(state.frontendCtx.TEXTURE_2D,
-        state.frontendCtx.TEXTURE_MIN_FILTER, state.frontendCtx.LINEAR);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, videoEl);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       jsUpdateQuadColors(videoEl);
     }
   }
@@ -240,7 +230,7 @@ function setupVideoReceive(stream) {
 }
 
 export function mpHost() {
-  state.mpIsHost = true;
+  setState('mpIsHost', true);
   startFrameCapture();
   peerInst = new window.Peer();
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
@@ -258,18 +248,14 @@ export function mpHost() {
       startPositionSync(conn);
     });
     conn.on('data', function(data) {
-      if (data.type === 'pos' && state.rendererModule) {
-        state.rendererModule.ccall('set_remote_player', 'void',
-          ['number','number','number','number','number','number'],
-          [remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0]);
-        state.rendererModule.ccall('set_remote_player_model', 'void',
-          ['number','number'], [remoteId, data.model || 0]);
+      if (data.type === 'pos' && renderer.isReady()) {
+        renderer.setRemotePlayer(remoteId, data.x, data.y, data.z, data.yaw, data.moving || 0);
+        renderer.setRemotePlayerModel(remoteId, data.model || 0);
         if (data.name !== remoteNames[remoteId]) {
           remoteNames[remoteId] = data.name || '';
           uploadNameplate(remoteId, remoteNames[remoteId]);
         }
-        // Relay this guest's position to all other guests (slot = remoteId + 1
-        // since slot 0 is reserved for the host from each guest's perspective)
+        // Relay this guest's position to all other guests
         const relay = { type: 'relay_pos', slot: remoteId + 1,
           x: data.x, y: data.y, z: data.z, yaw: data.yaw,
           moving: data.moving || 0, model: data.model || 0, name: data.name || '' };
@@ -279,13 +265,10 @@ export function mpHost() {
       } else if (data.type === 'scene') {
         applySceneState(data);
       } else if (data.type === 'btn') {
-        // Each guest owns their own controller port (remoteId 0 → port 1, etc.)
         if (state.coreWorker) {
           state.coreWorker.postMessage({ type: 'button', port: remoteId + 1, id: data.id, pressed: data.pressed });
         } else if (state.n64Running) {
-          // For N64: retro UP/DOWN/LEFT/RIGHT drive the analog stick axes, not d-pad buttons.
-          // N64 games read movement from axes[0]/axes[1]; the d-pad is rarely used.
-          const N64_AXIS = { 4: [1, -1], 5: [1, 1], 6: [0, -1], 7: [0, 1] }; // retroId → [axisIdx, sign]
+          const N64_AXIS = { [RETRO.UP]: [1, -1], [RETRO.DOWN]: [1, 1], [RETRO.LEFT]: [0, -1], [RETRO.RIGHT]: [0, 1] };
           const ax = N64_AXIS[data.id];
           if (ax) {
             setVirtualAxis(remoteId + 1, ax[0], data.pressed ? ax[1] : 0);
@@ -298,15 +281,12 @@ export function mpHost() {
       }
     });
     conn.on('close', function() {
-      // Tell other guests to remove this player from their scene
       mpConns.forEach(function(otherConn, i) {
         if (i !== remoteId && otherConn.open)
           otherConn.send({ type: 'remove_player', slot: remoteId + 1 });
       });
-      // If this guest had control, reset to host
       remoteNames[remoteId] = '';
-      if (state.rendererModule)
-        state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [remoteId]);
+      renderer.removeRemotePlayer(remoteId);
       mpConns.splice(mpConns.indexOf(conn), 1);
       mpSetStatus('Guest disconnected');
     });
@@ -324,60 +304,48 @@ export function mpHost() {
 
 export function mpJoin(hostId) {
   if (!hostId) return;
-  state.mpIsHost = false;
+  setState('mpIsHost', false);
   mpSetStatus('Connecting...');
   peerInst = new window.Peer();
   peerInst.on('error', e => mpSetStatus('Peer error: ' + e.type));
   peerInst.on('open', function() {
-    // Data channel for position sync
     hostConn = peerInst.connect(hostId, { reliable: false });
     hostConn.on('open', function() {
-      state.mpConnected = true;
+      setState('mpConnected', true);
       document.querySelector('.scene-section').style.display = 'none';
       mpSetStatus('Room ID: ' + hostId);
       startPositionSync(hostConn);
     });
     hostConn.on('data', function(data) {
-      if (data.type === 'pos' && state.rendererModule) {
-        state.rendererModule.ccall('set_remote_player', 'void',
-          ['number','number','number','number','number','number'],
-          [0, data.x, data.y, data.z, data.yaw, data.moving || 0]);
-        state.rendererModule.ccall('set_remote_player_model', 'void',
-          ['number','number'], [0, data.model || 0]);
+      if (data.type === 'pos' && renderer.isReady()) {
+        renderer.setRemotePlayer(0, data.x, data.y, data.z, data.yaw, data.moving || 0);
+        renderer.setRemotePlayerModel(0, data.model || 0);
         if (data.name !== remoteNames[0]) {
           remoteNames[0] = data.name || '';
           uploadNameplate(0, remoteNames[0]);
         }
-      } else if (data.type === 'relay_pos' && state.rendererModule) {
-        state.rendererModule.ccall('set_remote_player', 'void',
-          ['number','number','number','number','number','number'],
-          [data.slot, data.x, data.y, data.z, data.yaw, data.moving || 0]);
-        state.rendererModule.ccall('set_remote_player_model', 'void',
-          ['number','number'], [data.slot, data.model || 0]);
+      } else if (data.type === 'relay_pos' && renderer.isReady()) {
+        renderer.setRemotePlayer(data.slot, data.x, data.y, data.z, data.yaw, data.moving || 0);
+        renderer.setRemotePlayerModel(data.slot, data.model || 0);
         if (data.name !== remoteNames[data.slot]) {
           remoteNames[data.slot] = data.name || '';
           uploadNameplate(data.slot, remoteNames[data.slot]);
         }
       } else if (data.type === 'remove_player') {
         remoteNames[data.slot] = '';
-        if (state.rendererModule)
-          state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [data.slot]);
+        renderer.removeRemotePlayer(data.slot);
       } else if (data.type === 'scene') {
         applySceneState(data);
       }
     });
     hostConn.on('close', function() {
-      state.mpConnected = false;
+      setState('mpConnected', false);
       remoteNames[0] = '';
       document.querySelector('.scene-section').style.display = '';
-      if (state.rendererModule)
-        state.rendererModule.ccall('remove_remote_player', 'void', ['number'], [0]);
+      renderer.removeRemotePlayer(0);
       mpSetStatus('Host disconnected');
     });
 
-    // Caller must include tracks for every media type it wants to receive back.
-    // A video-only offer means the host can't send audio, so add a silent audio
-    // track too so the SDP gets an m=audio section.
     const dummyCanvas = document.createElement('canvas');
     dummyCanvas.width = 2; dummyCanvas.height = 2;
     const callTracks = dummyCanvas.captureStream ? [...dummyCanvas.captureStream(1).getTracks()] : [];
